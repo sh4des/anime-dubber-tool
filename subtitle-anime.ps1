@@ -63,6 +63,12 @@ if (-not $PSBoundParameters.ContainsKey('Verbose')) { $VerbosePreference = 'Cont
 # --- tool locations ----------------------------------------------------------
 $FFMPEG  = "ffmpeg"
 $FFPROBE = "ffprobe"
+# If -Python wasn't given explicitly, prefer a local .venv over the global python
+# (the global env has conflicting TTS/transformers deps).
+if (-not $PSBoundParameters.ContainsKey('Python')) {
+    $venvPy = Join-Path $PSScriptRoot ".venv\Scripts\python.exe"
+    if (Test-Path -LiteralPath $venvPy) { $Python = $venvPy }
+}
 $PYTHON  = $Python
 $TTS_SCRIPT = Join-Path $PSScriptRoot "srt_to_speech.py"
 
@@ -358,6 +364,7 @@ $freeGB = try {
     [math]::Round((Get-PSDrive -Name $scratchRoot.TrimEnd(':\')).Free / 1GB, 1)
 } catch { "?" }
 Write-Host "Local scratch: $Scratch  (drive $scratchRoot, $freeGB GB free)"
+Write-Host "Python: $PYTHON"
 
 $episodes = @(
     Get-ChildItem -LiteralPath $Folder -File |
