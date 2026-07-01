@@ -82,11 +82,20 @@ def main() -> int:
     args = ap.parse_args()
 
     # Heavy imports after arg parsing so --help stays instant.
-    import srt as srtlib
-    from pydub import AudioSegment
-    from pydub.effects import speedup
-    import torch
-    from TTS.api import TTS
+    try:
+        import srt as srtlib
+        from pydub import AudioSegment
+        from pydub.effects import speedup
+        import torch
+        from TTS.api import TTS
+    except ModuleNotFoundError as e:
+        print(f"[tts] missing Python dependency: {e.name}", file=sys.stderr)
+        print("[tts] install the GPU stack (RTX 50-series needs CUDA 12.8):",
+              file=sys.stderr)
+        print("      pip install coqui-tts pydub srt", file=sys.stderr)
+        print("      pip install torch torchaudio "
+              "--index-url https://download.pytorch.org/whl/cu128", file=sys.stderr)
+        return 3
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if device == "cuda":
