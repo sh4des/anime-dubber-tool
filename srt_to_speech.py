@@ -110,42 +110,75 @@ def main() -> int:
     print(f"[tts] voice={voice_desc}  language={args.language}  fit={args.fit}")
 
     with open(args.srt, encoding="utf-8-sig") as f:
-        subs = list(srtlib.parse(f.read()))
-    if not subs:
+        raw_subs = list(srtlib.parse(f.read()))
+    if not raw_subs:
         print("[tts] no subtitle cues found, nothing to do.", file=sys.stderr)
         return 2
 
+    # Deduplicate cues. Anime ASS subtitles often render the same dialogue on
+    # multiple layers/styles, so the ass->srt conversion yields the SAME text at
+    # overlapping times. Speaking each copy is one source of the "echo".
+    cues = []
+    dropped = 0
+    for s in raw_subs:
+        text = clean_text(s.content)
+        if not text:
+            continue
+        start, end = s.start.total_seconds(), s.end.total_seconds()
+        if any(c["text"] == text and start < c["end"] + 0.5 for c in cues[-8:]):
+            dropped += 1
+            continue
+        cues.append({"text": text, "start": start, "end": end})
+    if dropped:
+        print(f"[tts] dropped {dropped} duplicate/overlapping cue(s)")
+
     sr = 24000  # XTTS native sample rate
-    last_end_ms = max(s.end.total_seconds() for s in subs) * 1000.0
+    last_end_ms = max(c["end"] for c in cues) * 1000.0
     total_ms = int(max(args.duration * 1000.0, last_end_ms)) + 2000  # tail pad
-    print(f"[tts] {len(subs)} cues, building a "
-          f"{total_ms / 1000:.0f}s track")
+    print(f"[tts] {len(cues)} cues, building a {total_ms / 1000:.0f}s track")
     canvas = AudioSegment.silent(duration=total_ms, frame_rate=sr)
 
     voice = {"speaker_wav": args.speaker_wav} if args.speaker_wav \
         else {"speaker": args.speaker}
 
+    # XTTS inference params tuned to stop the model looping/repeating a line
+    # (its most common failure mode) - the other source of the "echo".
+    xtts_kw = dict(
+        temperature=0.7,
+        length_penalty=1.0,
+        repetition_penalty=5.0,
+        top_k=50,
+        top_p=0.85,
+        enable_text_splitting=True,
+    )
+
+    def synth(text, path):
+        # Fall back if a coqui-tts version rejects the extra inference kwargs.
+        try:
+            tts.tts_to_file(text=text, language=args.language,
+                            file_path=path, **voice, **xtts_kw)
+        except TypeError:
+            tts.tts_to_file(text=text, language=args.language,
+                            file_path=path, **voice)
+
     tmp = tempfile.mkdtemp(prefix="dub_")
-    n = len(subs)
-    for i, s in enumerate(subs):
-        text = clean_text(s.content)
-        if not text:
-            continue
+    n = len(cues)
+    for i, c in enumerate(cues):
+        text = c["text"]
 
         # Synthesize the (possibly chunked) line into one clip.
         clip = AudioSegment.empty()
         for j, piece in enumerate(split_long(text)):
             wav_path = os.path.join(tmp, f"{i}_{j}.wav")
-            tts.tts_to_file(text=piece, language=args.language,
-                            file_path=wav_path, **voice)
+            synth(piece, wav_path)
             clip += AudioSegment.from_file(wav_path)
 
-        start_ms = int(s.start.total_seconds() * 1000)
+        start_ms = int(c["start"] * 1000)
         fitted = ""
 
         # Optionally compress a line so it doesn't bleed over the next one.
         if args.fit and i + 1 < n:
-            gap = int(subs[i + 1].start.total_seconds() * 1000) - start_ms
+            gap = int(cues[i + 1]["start"] * 1000) - start_ms
             if gap > 0 and len(clip) > gap:
                 factor = min(len(clip) / gap, args.max_speed)
                 if factor > 1.01:
@@ -155,7 +188,8 @@ def main() -> int:
         canvas = canvas.overlay(clip, position=start_ms)
 
         if args.verbose:
-            ts = str(s.start).split(".")[0]
+            t = c["start"]
+            ts = f"{int(t//3600):02d}:{int(t//60%60):02d}:{int(t%60):02d}"
             preview = text if len(text) <= 60 else text[:57] + "..."
             print(f"[tts] {i + 1:>4}/{n} [{ts}] {len(clip) / 1000:4.1f}s "
                   f"{preview}{fitted}", flush=True)

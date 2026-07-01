@@ -1,13 +1,19 @@
 # install dependencies
+New-Item -ItemType Directory -Force "G:\Transcode\tmp","G:\Transcode\pip-cache" | Out-Null
+$env:TMP = "G:\Transcode\tmp"; $env:TEMP = "G:\Transcode\tmp"
+$env:PIP_CACHE_DIR = "G:\Transcode\pip-cache"
 
-pip uninstall -y TTS coqui-tts torch torchaudio
-pip install coqui-tts pydub srt
-pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu128
+py -3.12 -m venv "G:\Transcode\.venv-dub"
+$V = "G:\Transcode\.venv-dub\Scripts\python.exe"
 
+& $V -m pip install --upgrade pip
+& $V -m pip install coqui-tts pydub srt "transformers<5"
+& $V -m pip install "torch<2.9" "torchaudio<2.9" --index-url https://download.pytorch.org/whl/cu128
 
 # confirm 5080 is visible
-python -c "import torch; print('cuda:', torch.cuda.is_available()); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'NO CUDA')"
+& $V -c "import torch, torchaudio, transformers, numpy; from TTS.api import TTS; print('ALL OK', torch.__version__, 'cuda', torch.cuda.is_available(), '| tf', transformers.__version__)"
 
 
 # run script
-pwsh ./subtitle-anime.ps1 -Folder "\\10.0.23.105\media\TV\15-18 Animated\Mobile Suit Gundam ZZ" -Scratch "G:\Transcode"
+$env:TTS_HOME = "G:\Transcode\tts-cache"
+pwsh ./subtitle-anime.ps1 -Folder "\\10.0.23.105\media\TV\15-18 Animated\Mobile Suit Gundam ZZ" -Scratch "G:\Transcode" -Python "G:\Transcode\.venv-dub\Scripts\python.exe"

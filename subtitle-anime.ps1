@@ -230,52 +230,81 @@ function New-DubTrack {
 
 # Muxes: video copy + all original audio (untouched) + new English track
 # (dub at full volume mixed with original at $OriginalVolume) + original subs.
+#
+# Two passes on purpose:
+#   1) render the mixed English track to its OWN clean AAC file, and
+#   2) pure copy-mux everything together.
+# Piping a filtergraph straight into the final container gave the generated
+# track irregular timestamps/interleaving, which made players stutter the video
+# whenever that track was selected (the original tracks, being copied, were
+# fine). Rendering it standalone first gives it clean, continuous timestamps;
+# the final mux is then a plain -c copy with no filtering.
 function Merge-DubIntoVideo {
-    param([string]$Video, [string]$DubWav, $Probe, [string]$OutVideo)
+    param([string]$Video, [string]$DubWav, $Probe, [string]$OutVideo, [string]$WorkDir)
 
     $audioStreams = @($Probe.streams | Where-Object { $_.codec_type -eq "audio" })
     $origAudioCount = $audioStreams.Count
     $newIdx = $origAudioCount   # output audio index of the mixed English track
+    $mixedAac = Join-Path $WorkDir "mixed_english.m4a"
 
-    # English track = original(0:a:0) lowered to 60% + dub(1:a) at full,
-    # both forced to stereo for broad Plex client support, soft-limited to avoid clipping.
-    $filter = "[0:a:0]aformat=channel_layouts=stereo,volume=$OriginalVolume[orig];" +
-              "[1:a]aformat=channel_layouts=stereo,volume=1.0[dub];" +
-              "[orig][dub]amix=inputs=2:duration=longest:dropout_transition=0:normalize=0,alimiter=limit=0.95[mix]"
+    # English track = original(0:a:0) at $OriginalVolume + dub(1:a) at full.
+    # Both resampled to 48kHz stereo (broad client support), trimmed to the
+    # original audio length (duration=first), soft-limited to avoid clipping.
+    $filter = "[0:a:0]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,volume=$OriginalVolume[orig];" +
+              "[1:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,volume=1.0[dub];" +
+              "[orig][dub]amix=inputs=2:duration=first:dropout_transition=0:normalize=0,alimiter=limit=0.95[mix]"
 
-    Write-Verbose "  mixing new English track: dub@100% + original@$([int]($OriginalVolume*100))% (stereo)"
+    Write-Verbose "  [pass 1] rendering mixed English track: dub@100% + original@$([int]($OriginalVolume*100))% (stereo, 48kHz AAC)"
     Write-Verbose "  filter: $filter"
-    Write-Verbose "  original audio tracks kept: $origAudioCount; new English track = a:$newIdx (default)"
-
-    $ff = @(
+    $p1 = @(
         "-y", "-v", $FF_LOGLEVEL, "-stats",
         "-i", $Video,
         "-i", $DubWav,
         "-filter_complex", $filter,
+        "-map", "[mix]",
+        "-c:a", "aac", "-b:a", "256k", "-ar", "48000",
+        $mixedAac
+    )
+    Write-Cmd $FFMPEG $p1
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    & $FFMPEG @p1
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $mixedAac)) {
+        throw "ffmpeg mix (pass 1) failed for $Video"
+    }
+
+    # Pass 2: pure copy-mux. Video + all original audio + new English track
+    # (copied from the clean AAC) + subs + attachments. No re-encode.
+    Write-Verbose "  [pass 2] copy-muxing: video + $origAudioCount original audio + English track a:$newIdx (default)"
+    $p2 = @(
+        "-y", "-v", $FF_LOGLEVEL, "-stats",
+        "-i", $Video,
+        "-i", $mixedAac,
         "-map", "0:v",
         "-map", "0:a",
-        "-map", "[mix]",
+        "-map", "1:a",
         "-map", "0:s?",
         "-map", "0:t?",
         "-c", "copy",
-        "-c:a:$newIdx", "aac", "-b:a:$newIdx", "256k",
         "-metadata:s:a:$newIdx", "language=eng",
         "-metadata:s:a:$newIdx", "title=English Dub (AI)",
-        "-disposition:a:$newIdx", "default"
+        "-disposition:a:$newIdx", "default",
+        # clean up interleaving/timestamps so no track hitches the video
+        "-max_interleave_delta", "0",
+        "-avoid_negative_ts", "make_zero"
     )
     # Clear the default flag on the original audio tracks so Plex auto-picks English.
     for ($i = 0; $i -lt $origAudioCount; $i++) {
-        $ff += @("-disposition:a:$i", "0")
+        $p2 += @("-disposition:a:$i", "0")
     }
-    $ff += @($OutVideo)
+    $p2 += @($OutVideo)
 
-    Write-Cmd $FFMPEG $ff
-    $sw = [Diagnostics.Stopwatch]::StartNew()
-    & $FFMPEG @ff
+    Write-Cmd $FFMPEG $p2
+    & $FFMPEG @p2
     $sw.Stop()
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $OutVideo)) {
-        throw "ffmpeg mux failed for $Video"
+        throw "ffmpeg mux (pass 2) failed for $Video"
     }
+    Remove-Item -LiteralPath $mixedAac -Force -ErrorAction SilentlyContinue
     $sizeMB = [math]::Round((Get-Item -LiteralPath $OutVideo).Length / 1MB, 1)
     Write-Verbose ("  mux finished in {0:n1}s -> {1} ({2} MB)" -f $sw.Elapsed.TotalSeconds, $OutVideo, $sizeMB)
 }
@@ -328,7 +357,7 @@ function Invoke-Episode {
 
         Write-Host "  [6/6] muxing tracks (local)"
         $localOut = Join-Path $work "$base.dubbed.mkv"
-        Merge-DubIntoVideo -Video $localVideo -DubWav $dubWav -Probe $probe -OutVideo $localOut
+        Merge-DubIntoVideo -Video $localVideo -DubWav $dubWav -Probe $probe -OutVideo $localOut -WorkDir $work
 
         # Only now, after a fully successful local build, push the result back.
         # Copy to a .part file and rename on success, so an interrupted transfer
