@@ -17,3 +17,6 @@ $V = "G:\Transcode\.venv-dub\Scripts\python.exe"
 # run script
 $env:TTS_HOME = "G:\Transcode\tts-cache"
 pwsh ./subtitle-anime.ps1 -Folder "\\10.0.23.105\media\TV\15-18 Animated\Mobile Suit Gundam ZZ" -Scratch "G:\Transcode" -Python "G:\Transcode\.venv-dub\Scripts\python.exe"
+
+
+# 2024-07-01 9:20pm - TOUCH here to confirm this is a good working copy of the script with a single voice for all dubs

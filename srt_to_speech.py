@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # srt_to_speech.py
 # -----------------------------------------------------------------------------
+# 2024-07-01 9:20pm - TOUCH here to confirm this is a good working copy of the script with a single voice for all dubs
 # Reads an .srt subtitle file and produces a single WAV that is the spoken
 # English dub, with every line placed at its subtitle timestamp so the result
 # stays roughly in sync with the video.

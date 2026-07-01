@@ -1,3 +1,4 @@
+# 2024-07-01 9:20pm - TOUCH here to confirm this is a good working copy of the script with a single voice for all dubs
 # give me some code that does the following
 #
 # looks at a folder of anime episodes
