@@ -43,12 +43,24 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+# -Verbose is on by default so you can see every step; run with -Verbose:$false to quiet it.
+if (-not $PSBoundParameters.ContainsKey('Verbose')) { $VerbosePreference = 'Continue' }
 
 # --- tool locations ----------------------------------------------------------
 $FFMPEG  = "ffmpeg"
 $FFPROBE = "ffprobe"
 $PYTHON  = "python"
 $TTS_SCRIPT = Join-Path $PSScriptRoot "srt_to_speech.py"
+
+# ffmpeg log level: 'info' shows what it's doing without the per-frame firehose.
+$FF_LOGLEVEL = "info"
+
+# Echo an external command before running it, so the exact invocation is visible.
+function Write-Cmd {
+    param([string]$Exe, [string[]]$Arguments)
+    $rendered = ($Arguments | ForEach-Object { if ($_ -match '\s') { "`"$_`"" } else { $_ } }) -join ' '
+    Write-Host "  > $Exe $rendered" -ForegroundColor DarkGray
+}
 
 $VideoExtensions = @(".mkv", ".mp4", ".m4v", ".avi", ".ts")
 $TextSubCodecs   = @("subrip", "srt", "ass", "ssa", "mov_text", "webvtt", "text")
@@ -61,9 +73,24 @@ $OutputDir = Join-Path $Folder "dubbed"
 
 function Invoke-FFProbeJson {
     param([string]$Path)
+    Write-Verbose "Probing streams: $Path"
+    # JSON output must stay clean, so probe errors are still suppressed here.
     $json = & $FFPROBE -v error -print_format json -show_format -show_streams -- "$Path"
     if ($LASTEXITCODE -ne 0) { throw "ffprobe failed on $Path" }
-    return $json | ConvertFrom-Json
+    $data = $json | ConvertFrom-Json
+
+    # Summarize what we found so the user can see the source layout.
+    foreach ($s in $data.streams) {
+        $lang = if ($s.tags.language) { $s.tags.language } else { "und" }
+        $extra = switch ($s.codec_type) {
+            "video" { "$($s.width)x$($s.height)" }
+            "audio" { "$($s.channels)ch $($s.sample_rate)Hz" }
+            default { "" }
+        }
+        Write-Verbose ("  stream #{0,-2} {1,-9} {2,-10} lang={3,-3} {4}" -f `
+            $s.index, $s.codec_type, $s.codec_name, $lang, $extra)
+    }
+    return $data
 }
 
 function Get-VideoDuration {
@@ -107,11 +134,15 @@ function Get-EpisodeSubtitle {
 
     $outSrt = Join-Path $WorkDir "$base.extracted.srt"
     Write-Host "  subtitle: embedded stream #$($pick.index) ($($pick.codec_name)) -> srt"
-    & $FFMPEG -y -v error -i "$Video" -map "0:s:$relIndex" -c:s srt -- "$outSrt"
+    $exArgs = @("-y", "-v", $FF_LOGLEVEL, "-i", $Video, "-map", "0:s:$relIndex", "-c:s", "srt", $outSrt)
+    Write-Cmd $FFMPEG $exArgs
+    & $FFMPEG @exArgs
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path $outSrt)) {
         Write-Warning "  subtitle extraction failed."
         return $null
     }
+    $cueCount = (Select-String -Path $outSrt -Pattern '^\d+\s*$').Count
+    Write-Verbose "  extracted $cueCount subtitle cue(s) to $outSrt"
     return $outSrt
 }
 
@@ -129,12 +160,17 @@ function New-DubTrack {
     if ($SpeakerWav) { $pyArgs += @("--speaker-wav", $SpeakerWav) }
     else             { $pyArgs += @("--speaker", $Speaker) }
     if ($FitToCues)  { $pyArgs += "--fit" }
+    $pyArgs += "--verbose"
 
     Write-Host "  synthesizing dub on GPU..."
+    Write-Cmd $PYTHON $pyArgs
+    $sw = [Diagnostics.Stopwatch]::StartNew()
     & $PYTHON @pyArgs
+    $sw.Stop()
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path $OutWav)) {
         throw "TTS generation failed for $Srt"
     }
+    Write-Verbose ("  TTS finished in {0:n1}s -> {1}" -f $sw.Elapsed.TotalSeconds, $OutWav)
 }
 
 # Muxes: video copy + all original audio (untouched) + new English track
@@ -152,8 +188,12 @@ function Merge-DubIntoVideo {
               "[1:a]aformat=channel_layouts=stereo,volume=1.0[dub];" +
               "[orig][dub]amix=inputs=2:duration=longest:dropout_transition=0:normalize=0,alimiter=limit=0.95[mix]"
 
+    Write-Verbose "  mixing new English track: dub@100% + original@$([int]($OriginalVolume*100))% (stereo)"
+    Write-Verbose "  filter: $filter"
+    Write-Verbose "  original audio tracks kept: $origAudioCount; new English track = a:$newIdx (default)"
+
     $ff = @(
-        "-y", "-v", "error", "-stats",
+        "-y", "-v", $FF_LOGLEVEL, "-stats",
         "-i", $Video,
         "-i", $DubWav,
         "-filter_complex", $filter,
@@ -174,17 +214,23 @@ function Merge-DubIntoVideo {
     }
     $ff += @($OutVideo)
 
+    Write-Cmd $FFMPEG $ff
+    $sw = [Diagnostics.Stopwatch]::StartNew()
     & $FFMPEG @ff
+    $sw.Stop()
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path $OutVideo)) {
         throw "ffmpeg mux failed for $Video"
     }
+    $sizeMB = [math]::Round((Get-Item $OutVideo).Length / 1MB, 1)
+    Write-Verbose ("  mux finished in {0:n1}s -> {1} ({2} MB)" -f $sw.Elapsed.TotalSeconds, $OutVideo, $sizeMB)
 }
 
 # Full pipeline for one episode. Returns $true on success, $false if skipped.
 function Invoke-Episode {
     param([string]$Video)
 
-    Write-Host "`n=== $([IO.Path]::GetFileName($Video)) ==="
+    Write-Host "`n=== $([IO.Path]::GetFileName($Video)) ===" -ForegroundColor Cyan
+    $epSw = [Diagnostics.Stopwatch]::StartNew()
     $base    = [IO.Path]::GetFileNameWithoutExtension($Video)
     $outFile = Join-Path $OutputDir "$base.dubbed.mkv"
     if (Test-Path $outFile) {
@@ -192,22 +238,30 @@ function Invoke-Episode {
         return $true
     }
 
+    Write-Host "  [1/4] probing source"
     $probe = Invoke-FFProbeJson -Path $Video
+    $dur = Get-VideoDuration $probe
+    Write-Verbose ("  duration: {0:n0}s ({1:hh\:mm\:ss})" -f $dur, [TimeSpan]::FromSeconds($dur))
 
     $work = Join-Path ([IO.Path]::GetTempPath()) ("dub_" + [Guid]::NewGuid().ToString("N"))
     New-Item -ItemType Directory -Path $work | Out-Null
+    Write-Verbose "  work dir: $work"
     try {
+        Write-Host "  [2/4] finding subtitles"
         $srt = Get-EpisodeSubtitle -Video $Video -Probe $probe -WorkDir $work
         if (-not $srt) {
             Write-Warning "  no usable subtitles, skipping."
             return $false
         }
 
+        Write-Host "  [3/4] generating English dub (TTS)"
         $dubWav = Join-Path $work "$base.dub.wav"
-        New-DubTrack -Srt $srt -Duration (Get-VideoDuration $probe) -OutWav $dubWav
+        New-DubTrack -Srt $srt -Duration $dur -OutWav $dubWav
 
+        Write-Host "  [4/4] muxing tracks"
         Merge-DubIntoVideo -Video $Video -DubWav $dubWav -Probe $probe -OutVideo $outFile
-        Write-Host "  done -> $outFile"
+        $epSw.Stop()
+        Write-Host ("  done in {0:n1}s -> {1}" -f $epSw.Elapsed.TotalSeconds, $outFile) -ForegroundColor Green
         return $true
     }
     finally {

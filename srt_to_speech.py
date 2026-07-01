@@ -77,6 +77,8 @@ def main() -> int:
                     help="speed up lines that overrun into the next cue")
     ap.add_argument("--max-speed", type=float, default=1.6,
                     help="cap for --fit time-compression")
+    ap.add_argument("--verbose", action="store_true",
+                    help="log every line as it is synthesized")
     args = ap.parse_args()
 
     # Heavy imports after arg parsing so --help stays instant.
@@ -87,12 +89,16 @@ def main() -> int:
     from TTS.api import TTS
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    if device == "cpu":
+    if device == "cuda":
+        name = torch.cuda.get_device_name(0)
+        print(f"[tts] device=cuda ({name})")
+    else:
         print("[tts] WARNING: CUDA not available, running on CPU (very slow).",
               file=sys.stderr)
-    print(f"[tts] device={device}  model={XTTS_MODEL}")
-
+    print(f"[tts] loading model {XTTS_MODEL} ...")
     tts = TTS(XTTS_MODEL).to(device)
+    voice_desc = args.speaker_wav if args.speaker_wav else args.speaker
+    print(f"[tts] voice={voice_desc}  language={args.language}  fit={args.fit}")
 
     with open(args.srt, encoding="utf-8-sig") as f:
         subs = list(srtlib.parse(f.read()))
@@ -103,6 +109,8 @@ def main() -> int:
     sr = 24000  # XTTS native sample rate
     last_end_ms = max(s.end.total_seconds() for s in subs) * 1000.0
     total_ms = int(max(args.duration * 1000.0, last_end_ms)) + 2000  # tail pad
+    print(f"[tts] {len(subs)} cues, building a "
+          f"{total_ms / 1000:.0f}s track")
     canvas = AudioSegment.silent(duration=total_ms, frame_rate=sr)
 
     voice = {"speaker_wav": args.speaker_wav} if args.speaker_wav \
@@ -124,6 +132,7 @@ def main() -> int:
             clip += AudioSegment.from_file(wav_path)
 
         start_ms = int(s.start.total_seconds() * 1000)
+        fitted = ""
 
         # Optionally compress a line so it doesn't bleed over the next one.
         if args.fit and i + 1 < n:
@@ -132,10 +141,17 @@ def main() -> int:
                 factor = min(len(clip) / gap, args.max_speed)
                 if factor > 1.01:
                     clip = speedup(clip, playback_speed=factor)
+                    fitted = f" (sped up {factor:.2f}x to fit)"
 
         canvas = canvas.overlay(clip, position=start_ms)
-        if (i + 1) % 25 == 0 or i + 1 == n:
-            print(f"[tts] {i + 1}/{n} lines")
+
+        if args.verbose:
+            ts = str(s.start).split(".")[0]
+            preview = text if len(text) <= 60 else text[:57] + "..."
+            print(f"[tts] {i + 1:>4}/{n} [{ts}] {len(clip) / 1000:4.1f}s "
+                  f"{preview}{fitted}", flush=True)
+        elif (i + 1) % 25 == 0 or i + 1 == n:
+            print(f"[tts] {i + 1}/{n} lines", flush=True)
 
     canvas.export(args.out, format="wav")
     print(f"[tts] wrote {args.out}")
