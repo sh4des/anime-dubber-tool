@@ -9,6 +9,9 @@ $V = "G:\Transcode\.venv-dub\Scripts\python.exe"
 & $V -m pip install --upgrade pip
 & $V -m pip install coqui-tts pydub srt "transformers<5"
 & $V -m pip install "torch<2.9" "torchaudio<2.9" --index-url https://download.pytorch.org/whl/cu128
+# variant 2 only: cross-episode character tracking (speaker fingerprints).
+# Omit and the multi-voice script falls back to per-line pitch buckets.
+& $V -m pip install resemblyzer
 
 # confirm 5080 is visible
 & $V -c "import torch, torchaudio, transformers, numpy; from TTS.api import TTS; print('ALL OK', torch.__version__, 'cuda', torch.cuda.is_available(), '| tf', transformers.__version__)"
@@ -20,16 +23,18 @@ $env:TTS_HOME = "G:\Transcode\tts-cache"
 # --- variant 1: basic, single voice for every line ---------------------------
 pwsh ./subtitle-anime.ps1 -Folder "\\10.0.23.105\media\TV\15-18 Animated\Mobile Suit Gundam ZZ" -Scratch "G:\Transcode" -Python "G:\Transcode\.venv-dub\Scripts\python.exe"
 
-# --- variant 2: unique voices per character type -----------------------------
-# Classifies each line by the pitch of the original Japanese speech under it and
-# picks one of four voices (adult male/female, child male/female). No new deps:
-# pitch detection reuses torchaudio. child male vs child female is approximate
-# (pre-pubescent voices overlap) - tune -ChildSplit, or set both child voices
-# the same if you only want "a kid voice".
+# --- variant 2: unique voice per CHARACTER, tracked across episodes ----------
+# Fingerprints the original Japanese speech under each line, matches it to the
+# show's recurring characters, and gives each character their own consistent
+# voice for the whole series. State lives in <Folder>\anime-dub-voices.json
+# (delete it to reset the cast). New characters are bucketed adult/child x
+# male/female by pitch and assigned a distinct voice from that pool.
 pwsh ./subtitle-anime-unique-voices.ps1 -Folder "\\10.0.23.105\media\TV\15-18 Animated\Mobile Suit Gundam ZZ" -Scratch "G:\Transcode" -Python "G:\Transcode\.venv-dub\Scripts\python.exe"
-# tune voices/thresholds per show, e.g.:
+# tune matching/thresholds per show, e.g.:
 #   pwsh ./subtitle-anime-unique-voices.ps1 -Folder "..." -Scratch "G:\Transcode" `
-#        -VoiceAdultFemale "Sofia Hellen" -ChildSplit 310 -ChildPitchShift 3 -All
+#        -MatchThreshold 0.78 -ChildSplit 310 -ChildPitchShift 3 -All
+# NOTE: process episodes in order (default sort) on the first pass so characters
+# are discovered consistently; the profile is updated after every episode.
 
 
 # 2024-07-01 9:20pm - TOUCH here to confirm this is a good working copy of the script with a single voice for all dubs

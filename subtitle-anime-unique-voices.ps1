@@ -4,29 +4,31 @@
 # subtitles, TTS them to an English track, mix over the original at reduced
 # volume, remux so Plex auto-picks the English dub and the original audio stays.
 #
-# The ONE difference: instead of one voice for every line, each subtitle line is
-# spoken by one of four voices - adult male / adult female / child male / child
-# female - chosen by measuring the pitch of the ORIGINAL (Japanese) speech under
-# that cue. See srt_to_speech_multivoice.py for the classification details and
-# its (honest) limitations, chiefly that child-male vs child-female is only
-# approximate because pre-pubescent voices overlap in pitch.
+# The difference from the basic script: each subtitle line is spoken by the
+# voice of the CHARACTER who says it, and characters are tracked ACROSS EPISODES
+# so a recurring character keeps the same voice through the whole show.
 #
-# Because a recurring character keeps a stable voice, they tend to land in the
-# same bucket across episodes - which is what you want for a series with the
-# same cast.
+# The target folder is one show, so a persistent character profile is kept at
+# -ProfilePath (defaults to <Folder>\anime-dub-voices.json). For each cue the
+# ORIGINAL (Japanese) audio under it is fingerprinted (resemblyzer d-vector) and
+# matched to the nearest known character; unknown voices become new characters,
+# each assigned a pitch bucket (adult/child x male/female) and a DISTINCT voice
+# from that bucket's pool. See srt_to_speech_multivoice.py for the full method
+# and its (honest) limitations. Without resemblyzer installed it degrades to
+# stateless per-line pitch buckets and says so.
 #
 # -----------------------------------------------------------------------------
 # Requires (on PATH or set the *_EXE vars below):
 #   ffmpeg, ffprobe   (https://www.gyan.dev/ffmpeg/builds/)
-#   python            (with srt_to_speech_multivoice.py deps - same as the basic
-#                      script; pitch detection reuses torchaudio, no new deps)
+#   python            (basic deps + `pip install resemblyzer` for cross-episode
+#                      character tracking; pitch detection reuses torchaudio)
 # Usage:
 #   pwsh ./subtitle-anime-unique-voices.ps1 -Folder "\\10.0.23.105\media\tv\...\MyShow"
 #   pwsh ./subtitle-anime-unique-voices.ps1 -Folder "..." -All
 #   pwsh ./subtitle-anime-unique-voices.ps1 -Folder "..." -Scratch "D:\dub-scratch"
-#   # tune voices / thresholds for a show:
+#   # tune matching / thresholds for a show:
 #   pwsh ./subtitle-anime-unique-voices.ps1 -Folder "..." `
-#        -VoiceAdultFemale "Sofia Hellen" -ChildSplit 310 -ChildPitchShift 3
+#        -MatchThreshold 0.78 -ChildSplit 310 -ChildPitchShift 3
 #
 # Same network-share behaviour as the basic script: source is copied to
 # -Scratch (local disk), all work happens locally, result is copied back to
@@ -44,24 +46,34 @@ param(
     # Volume the original audio is mixed down to under the English dub (0.6 = 60%).
     [double]$OriginalVolume = 0.6,
 
-    # --- the four dub voices (XTTS built-in speaker names) --------------------
-    # "Damien Black" matches the basic script's default, so adult-male lines
-    # sound identical to the single-voice dub.
-    [string]$VoiceAdultMale   = "Damien Black",
-    [string]$VoiceAdultFemale = "Alison Dietlinde",
-    [string]$VoiceChildMale   = "Andrew Chipper",
-    [string]$VoiceChildFemale = "Tammie Ema",
-    # Voice used when a cue has no clear speech pitch (music/SFX/overlap).
+    # --- persistent character profile (show-level) ---------------------------
+    # One JSON per show; recurring characters keep their voice across episodes.
+    # Delete it to reset the cast; back it up before re-running to reuse it.
+    [string]$ProfilePath = "",
+    # Cosine similarity to treat a line as an existing character. Higher = more
+    # distinct characters (and more accidental splits); lower = more merging.
+    [double]$MatchThreshold = 0.75,
+
+    # --- voice pools per bucket (XTTS built-in speaker names) -----------------
+    # New characters get the first unused pool voice for their bucket, then the
+    # pool cycles. Empty = use the script's built-in pools (see the .py header).
+    # "Damien Black" leads the adult-male pool, matching the basic script.
+    [string[]]$VoicesAdultMale   = @(),
+    [string[]]$VoicesAdultFemale = @(),
+    [string[]]$VoicesChildMale   = @(),
+    [string[]]$VoicesChildFemale = @(),
+    # Voice for lines with no clear speaker (music/SFX/overlap); default = first
+    # adult-male pool voice.
     [string]$VoiceDefault     = "",
 
-    # --- pitch classification thresholds (Hz), tune per show ------------------
+    # --- pitch buckets (Hz) - decide a NEW character's gender/age + voice pool -
     [double]$MaleMax        = 155,   # below this  -> adult male
     [double]$AdultFemaleMax = 250,   # below this  -> adult female
     [double]$ChildSplit     = 300,   # below this  -> child male, else child female
     # Semitones to raise child clips so adult XTTS voices read younger (0 = off).
     [double]$ChildPitchShift = 2.0,
 
-    # Which ORIGINAL audio stream to analyse for pitch (0 = first = usually JP).
+    # Which ORIGINAL audio stream to analyse (0 = first = usually JP).
     [int]$RefAudioIndex = 0,
 
     # Speed up dub lines that overrun the next subtitle cue (keeps lip-ish sync).
@@ -107,6 +119,9 @@ $TextSubCodecs   = @("subrip", "srt", "ass", "ssa", "mov_text", "webvtt", "text"
 
 # Where finished files go (originals are never modified in place).
 $OutputDir = Join-Path $Folder "dubbed"
+
+# Show-level character profile shared by every episode in this folder.
+if (-not $ProfilePath) { $ProfilePath = Join-Path $Folder "anime-dub-voices.json" }
 
 
 # --- helpers -----------------------------------------------------------------
@@ -245,17 +260,20 @@ function New-DubTrack {
         "--srt", $Srt,
         "--out", $OutWav,
         "--ref-audio", $RefAudio,
+        "--profile", $ProfilePath,
         "--duration", $Duration,
         "--language", "en",
-        "--voice-adult-male",   $VoiceAdultMale,
-        "--voice-adult-female", $VoiceAdultFemale,
-        "--voice-child-male",   $VoiceChildMale,
-        "--voice-child-female", $VoiceChildFemale,
+        "--match-threshold",  $MatchThreshold,
         "--male-max",         $MaleMax,
         "--adult-female-max", $AdultFemaleMax,
         "--child-split",      $ChildSplit,
         "--child-pitch-shift", $ChildPitchShift
     )
+    # Voice pools are ';'-separated; only send overrides, else the .py defaults win.
+    if ($VoicesAdultMale)   { $pyArgs += @("--voices-adult-male",   ($VoicesAdultMale   -join ';')) }
+    if ($VoicesAdultFemale) { $pyArgs += @("--voices-adult-female", ($VoicesAdultFemale -join ';')) }
+    if ($VoicesChildMale)   { $pyArgs += @("--voices-child-male",   ($VoicesChildMale   -join ';')) }
+    if ($VoicesChildFemale) { $pyArgs += @("--voices-child-female", ($VoicesChildFemale -join ';')) }
     if ($VoiceDefault) { $pyArgs += @("--voice-default", $VoiceDefault) }
     if ($FitToCues)    { $pyArgs += "--fit" }
     $pyArgs += "--verbose"
@@ -432,9 +450,9 @@ $freeGB = try {
 } catch { "?" }
 Write-Host "Local scratch: $Scratch  (drive $scratchRoot, $freeGB GB free)"
 Write-Host "Python: $PYTHON"
-Write-Host ("Voices: AM=$VoiceAdultMale | AF=$VoiceAdultFemale | " +
-            "CM=$VoiceChildMale | CF=$VoiceChildFemale")
-Write-Host ("Pitch buckets (Hz): male<$MaleMax, adultF<$AdultFemaleMax, " +
+$profileState = if (Test-Path -LiteralPath $ProfilePath) { "existing" } else { "new" }
+Write-Host "Character profile: $ProfilePath ($profileState, match>=$MatchThreshold)"
+Write-Host ("Pitch buckets for new characters (Hz): male<$MaleMax, adultF<$AdultFemaleMax, " +
             "childM<$ChildSplit, else childF  | child +$ChildPitchShift semitones")
 
 $episodes = @(
