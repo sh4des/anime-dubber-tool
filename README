@@ -16,7 +16,20 @@ $V = "G:\Transcode\.venv-dub\Scripts\python.exe"
 
 # run script
 $env:TTS_HOME = "G:\Transcode\tts-cache"
+
+# --- variant 1: basic, single voice for every line ---------------------------
 pwsh ./subtitle-anime.ps1 -Folder "\\10.0.23.105\media\TV\15-18 Animated\Mobile Suit Gundam ZZ" -Scratch "G:\Transcode" -Python "G:\Transcode\.venv-dub\Scripts\python.exe"
+
+# --- variant 2: unique voices per character type -----------------------------
+# Classifies each line by the pitch of the original Japanese speech under it and
+# picks one of four voices (adult male/female, child male/female). No new deps:
+# pitch detection reuses torchaudio. child male vs child female is approximate
+# (pre-pubescent voices overlap) - tune -ChildSplit, or set both child voices
+# the same if you only want "a kid voice".
+pwsh ./subtitle-anime-unique-voices.ps1 -Folder "\\10.0.23.105\media\TV\15-18 Animated\Mobile Suit Gundam ZZ" -Scratch "G:\Transcode" -Python "G:\Transcode\.venv-dub\Scripts\python.exe"
+# tune voices/thresholds per show, e.g.:
+#   pwsh ./subtitle-anime-unique-voices.ps1 -Folder "..." -Scratch "G:\Transcode" `
+#        -VoiceAdultFemale "Sofia Hellen" -ChildSplit 310 -ChildPitchShift 3 -All
 
 
 # 2024-07-01 9:20pm - TOUCH here to confirm this is a good working copy of the script with a single voice for all dubs
