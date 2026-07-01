@@ -374,7 +374,14 @@ function Invoke-Episode {
     $base    = [IO.Path]::GetFileNameWithoutExtension($Video)
     $outFile = Join-Path $OutputDir "$base.dubbed.mkv"
     if (Test-Path -LiteralPath $outFile) {
-        Write-Host "  already done, skipping."
+        Write-Host "  already done, skipping (output in $OutputDir)."
+        return $true
+    }
+    # Also skip if a finished dub was moved back next to the source, so re-runs
+    # over the show folder don't redo episodes you've already filed away.
+    $srcDub = Join-Path ([IO.Path]::GetDirectoryName($Video)) "$base.dubbed.mkv"
+    if (Test-Path -LiteralPath $srcDub) {
+        Write-Host "  already dubbed in source, skipping ($([IO.Path]::GetFileName($srcDub)))."
         return $true
     }
 
@@ -462,6 +469,9 @@ Write-Host ("Pitch buckets for new characters (Hz): male<$MaleMax, adultF<$Adult
 $episodes = @(
     Get-ChildItem -LiteralPath $Folder -File |
         Where-Object { $VideoExtensions -contains $_.Extension.ToLower() } |
+        # Skip our own outputs if they were moved back into the source folder,
+        # so we never try to dub an already-dubbed file.
+        Where-Object { $_.Name -notlike "*.dubbed.mkv" } |
         Sort-Object Name
 )
 if ($episodes.Count -eq 0) { throw "No video files found in $Folder" }
