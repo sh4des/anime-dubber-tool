@@ -19,8 +19,13 @@
 #   ffmpeg, ffprobe   (https://www.gyan.dev/ffmpeg/builds/)
 #   python            (with srt_to_speech.py deps installed - see that file's header)
 # Usage:
-#   pwsh ./subtitle-anime.ps1 -Folder "D:\Anime\MyShow"
-#   pwsh ./subtitle-anime.ps1 -Folder "D:\Anime\MyShow" -All        # skip the test prompt
+#   pwsh ./subtitle-anime.ps1 -Folder "\\10.0.23.105\media\tv\...\MyShow"
+#   pwsh ./subtitle-anime.ps1 -Folder "..." -All                    # skip the test prompt
+#   pwsh ./subtitle-anime.ps1 -Folder "..." -Scratch "D:\dub-scratch"  # fast local disk
+#
+# Network shares: the source is copied to -Scratch (local disk, defaults to TEMP),
+# all work happens locally, then the finished file is copied back to <Folder>\dubbed.
+# Make sure -Scratch has room for ~2x one episode (source copy + output).
 # -----------------------------------------------------------------------------
 
 [CmdletBinding()]
@@ -39,7 +44,11 @@ param(
     [string]$SpeakerWav = "",
 
     # Speed up dub lines that overrun the next subtitle cue (keeps lip-ish sync).
-    [switch]$FitToCues
+    [switch]$FitToCues,
+
+    # Local fast disk used as scratch. Source is copied here to avoid slow,
+    # repeated reads/writes over the network share; result is copied back after.
+    [string]$Scratch = ([IO.Path]::GetTempPath())
 )
 
 $ErrorActionPreference = "Stop"
@@ -98,10 +107,12 @@ function Get-VideoDuration {
     [double]$Probe.format.duration
 }
 
-# Returns a path to an English .srt for this episode, or $null if none usable.
-# Prefers a sidecar .srt, then an embedded *text* subtitle (eng if tagged).
-function Get-EpisodeSubtitle {
-    param([string]$Video, $Probe, [string]$WorkDir)
+# Decide where this episode's English subtitles will come from, WITHOUT reading
+# the big video file (cheap - runs over the network before we copy anything).
+# Returns a plan object, or $null if there is nothing usable (so we can skip the
+# copy entirely). Prefers a sidecar .srt, then an embedded *text* subtitle.
+function Get-SubtitlePlan {
+    param([string]$Video, $Probe)
 
     $base = [IO.Path]::GetFileNameWithoutExtension($Video)
     $dir  = [IO.Path]::GetDirectoryName($Video)
@@ -109,9 +120,10 @@ function Get-EpisodeSubtitle {
     # 1) sidecar files next to the video
     foreach ($cand in @("$base.en.srt", "$base.eng.srt", "$base.srt")) {
         $p = Join-Path $dir $cand
-        if (Test-Path $p) {
-            Write-Host "  subtitle: sidecar $cand"
-            return $p
+        # -LiteralPath: filenames often contain [brackets], which Test-Path
+        # otherwise treats as wildcards and fails to match.
+        if (Test-Path -LiteralPath $p) {
+            return [pscustomobject]@{ Type = "sidecar"; Path = $p; Desc = "sidecar $cand" }
         }
     }
 
@@ -132,18 +144,50 @@ function Get-EpisodeSubtitle {
     # ffmpeg -map 0:s:N uses the subtitle-relative index, so find it among subs.
     $relIndex = [Array]::IndexOf(($subs | ForEach-Object { $_.index }), $pick.index)
 
-    $outSrt = Join-Path $WorkDir "$base.extracted.srt"
-    Write-Host "  subtitle: embedded stream #$($pick.index) ($($pick.codec_name)) -> srt"
-    $exArgs = @("-y", "-v", $FF_LOGLEVEL, "-i", $Video, "-map", "0:s:$relIndex", "-c:s", "srt", $outSrt)
+    return [pscustomobject]@{
+        Type     = "embedded"
+        RelIndex = $relIndex
+        Desc     = "embedded stream #$($pick.index) ($($pick.codec_name))"
+    }
+}
+
+# Produce the actual .srt from a plan. For embedded subs this reads the video,
+# so it is pointed at the LOCAL copy, not the network source.
+function Export-Subtitle {
+    param($Plan, [string]$ExtractFrom, [string]$WorkDir, [string]$Base)
+
+    if ($Plan.Type -eq "sidecar") {
+        Write-Host "  subtitle: $($Plan.Desc)"
+        return $Plan.Path
+    }
+
+    $outSrt = Join-Path $WorkDir "$Base.extracted.srt"
+    Write-Host "  subtitle: $($Plan.Desc) -> srt"
+    $exArgs = @("-y", "-v", $FF_LOGLEVEL, "-i", $ExtractFrom, "-map", "0:s:$($Plan.RelIndex)", "-c:s", "srt", $outSrt)
     Write-Cmd $FFMPEG $exArgs
     & $FFMPEG @exArgs
-    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $outSrt)) {
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $outSrt)) {
         Write-Warning "  subtitle extraction failed."
         return $null
     }
-    $cueCount = (Select-String -Path $outSrt -Pattern '^\d+\s*$').Count
+    $cueCount = (Select-String -LiteralPath $outSrt -Pattern '^\d+\s*$').Count
     Write-Verbose "  extracted $cueCount subtitle cue(s) to $outSrt"
     return $outSrt
+}
+
+# Copy a file with progress/throughput logging. Returns the destination path.
+function Copy-WithProgress {
+    param([string]$Source, [string]$Destination, [string]$Label)
+    $srcInfo = Get-Item -LiteralPath $Source
+    $sizeMB = [math]::Round($srcInfo.Length / 1MB, 1)
+    Write-Host "  $Label ($sizeMB MB)..."
+    Write-Verbose "    $Source -> $Destination"
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    Copy-Item -LiteralPath $Source -Destination $Destination -Force
+    $sw.Stop()
+    $secs = [math]::Max($sw.Elapsed.TotalSeconds, 0.001)
+    Write-Verbose ("    copied in {0:n1}s ({1:n1} MB/s)" -f $secs, ($sizeMB / $secs))
+    return $Destination
 }
 
 # Calls the Python TTS helper to render the timed English WAV.
@@ -167,7 +211,7 @@ function New-DubTrack {
     $sw = [Diagnostics.Stopwatch]::StartNew()
     & $PYTHON @pyArgs
     $sw.Stop()
-    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $OutWav)) {
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $OutWav)) {
         throw "TTS generation failed for $Srt"
     }
     Write-Verbose ("  TTS finished in {0:n1}s -> {1}" -f $sw.Elapsed.TotalSeconds, $OutWav)
@@ -218,10 +262,10 @@ function Merge-DubIntoVideo {
     $sw = [Diagnostics.Stopwatch]::StartNew()
     & $FFMPEG @ff
     $sw.Stop()
-    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $OutVideo)) {
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $OutVideo)) {
         throw "ffmpeg mux failed for $Video"
     }
-    $sizeMB = [math]::Round((Get-Item $OutVideo).Length / 1MB, 1)
+    $sizeMB = [math]::Round((Get-Item -LiteralPath $OutVideo).Length / 1MB, 1)
     Write-Verbose ("  mux finished in {0:n1}s -> {1} ({2} MB)" -f $sw.Elapsed.TotalSeconds, $OutVideo, $sizeMB)
 }
 
@@ -233,51 +277,79 @@ function Invoke-Episode {
     $epSw = [Diagnostics.Stopwatch]::StartNew()
     $base    = [IO.Path]::GetFileNameWithoutExtension($Video)
     $outFile = Join-Path $OutputDir "$base.dubbed.mkv"
-    if (Test-Path $outFile) {
+    if (Test-Path -LiteralPath $outFile) {
         Write-Host "  already done, skipping."
         return $true
     }
 
-    Write-Host "  [1/4] probing source"
+    Write-Host "  [1/6] probing source"
     $probe = Invoke-FFProbeJson -Path $Video
     $dur = Get-VideoDuration $probe
     Write-Verbose ("  duration: {0:n0}s ({1:hh\:mm\:ss})" -f $dur, [TimeSpan]::FromSeconds($dur))
 
-    $work = Join-Path ([IO.Path]::GetTempPath()) ("dub_" + [Guid]::NewGuid().ToString("N"))
-    New-Item -ItemType Directory -Path $work | Out-Null
-    Write-Verbose "  work dir: $work"
-    try {
-        Write-Host "  [2/4] finding subtitles"
-        $srt = Get-EpisodeSubtitle -Video $Video -Probe $probe -WorkDir $work
-        if (-not $srt) {
-            Write-Warning "  no usable subtitles, skipping."
-            return $false
-        }
+    # Decide subtitle source over the network first - if there's nothing usable,
+    # bail before copying gigabytes we'd only throw away.
+    Write-Host "  [2/6] locating subtitles"
+    $plan = Get-SubtitlePlan -Video $Video -Probe $probe
+    if (-not $plan) {
+        Write-Warning "  no usable subtitles, skipping (no copy made)."
+        return $false
+    }
+    Write-Verbose "  subtitle plan: $($plan.Desc)"
 
-        Write-Host "  [3/4] generating English dub (TTS)"
+    $work = Join-Path $Scratch ("dub_" + [Guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Path $work | Out-Null
+    Write-Verbose "  local scratch: $work"
+    try {
+        # Copy the source to local disk so extraction + mux don't stream it over
+        # the network repeatedly.
+        Write-Host "  [3/6] copying source to local scratch"
+        $localVideo = Join-Path $work ([IO.Path]::GetFileName($Video))
+        Copy-WithProgress -Source $Video -Destination $localVideo -Label "copy source local" | Out-Null
+
+        Write-Host "  [4/6] extracting subtitles"
+        $srt = Export-Subtitle -Plan $plan -ExtractFrom $localVideo -WorkDir $work -Base $base
+        if (-not $srt) { return $false }
+
+        Write-Host "  [5/6] generating English dub (TTS)"
         $dubWav = Join-Path $work "$base.dub.wav"
         New-DubTrack -Srt $srt -Duration $dur -OutWav $dubWav
 
-        Write-Host "  [4/4] muxing tracks"
-        Merge-DubIntoVideo -Video $Video -DubWav $dubWav -Probe $probe -OutVideo $outFile
+        Write-Host "  [6/6] muxing tracks (local)"
+        $localOut = Join-Path $work "$base.dubbed.mkv"
+        Merge-DubIntoVideo -Video $localVideo -DubWav $dubWav -Probe $probe -OutVideo $localOut
+
+        # Only now, after a fully successful local build, push the result back.
+        # Copy to a .part file and rename on success, so an interrupted transfer
+        # never leaves a truncated file that later looks "already done".
+        Write-Host "  copying result back to $OutputDir"
+        $partFile = "$outFile.part"
+        if (Test-Path -LiteralPath $partFile) { Remove-Item -LiteralPath $partFile -Force }
+        Copy-WithProgress -Source $localOut -Destination $partFile -Label "copy result back" | Out-Null
+        Move-Item -LiteralPath $partFile -Destination $outFile -Force
+
         $epSw.Stop()
         Write-Host ("  done in {0:n1}s -> {1}" -f $epSw.Elapsed.TotalSeconds, $outFile) -ForegroundColor Green
         return $true
     }
     finally {
-        Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
 
 
 # --- main --------------------------------------------------------------------
 
-if (-not (Test-Path $Folder)) { throw "Folder not found: $Folder" }
-if (-not (Test-Path $TTS_SCRIPT)) { throw "Missing TTS helper: $TTS_SCRIPT" }
-New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
+if (-not (Test-Path -LiteralPath $Folder)) { throw "Folder not found: $Folder" }
+if (-not (Test-Path -LiteralPath $TTS_SCRIPT)) { throw "Missing TTS helper: $TTS_SCRIPT" }
+if (-not (Test-Path -LiteralPath $Scratch)) { throw "Scratch folder not found: $Scratch" }
+if (-not (Test-Path -LiteralPath $OutputDir)) {
+    New-Item -ItemType Directory -Path $OutputDir | Out-Null
+}
+Write-Verbose "Local scratch: $Scratch"
 
 $episodes = @(
-    Get-ChildItem -Path $Folder -File |
+    Get-ChildItem -LiteralPath $Folder -File |
         Where-Object { $VideoExtensions -contains $_.Extension.ToLower() } |
         Sort-Object Name
 )
