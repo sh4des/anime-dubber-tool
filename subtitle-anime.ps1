@@ -48,7 +48,12 @@ param(
 
     # Local fast disk used as scratch. Source is copied here to avoid slow,
     # repeated reads/writes over the network share; result is copied back after.
-    [string]$Scratch = ([IO.Path]::GetTempPath())
+    [string]$Scratch = ([IO.Path]::GetTempPath()),
+
+    # Python interpreter to run the TTS helper. Point this at a venv to avoid
+    # global site-packages dependency conflicts, e.g.
+    #   -Python "C:\source\dw-projects\subtitle-anime-dub\.venv\Scripts\python.exe"
+    [string]$Python = "python"
 )
 
 $ErrorActionPreference = "Stop"
@@ -58,7 +63,7 @@ if (-not $PSBoundParameters.ContainsKey('Verbose')) { $VerbosePreference = 'Cont
 # --- tool locations ----------------------------------------------------------
 $FFMPEG  = "ffmpeg"
 $FFPROBE = "ffprobe"
-$PYTHON  = "python"
+$PYTHON  = $Python
 $TTS_SCRIPT = Join-Path $PSScriptRoot "srt_to_speech.py"
 
 # ffmpeg log level: 'info' shows what it's doing without the per-frame firehose.
