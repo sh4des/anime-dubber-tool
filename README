@@ -11,7 +11,13 @@ $V = "G:\Transcode\.venv-dub\Scripts\python.exe"
 & $V -m pip install "torch<2.9" "torchaudio<2.9" --index-url https://download.pytorch.org/whl/cu128
 # variant 2 only: cross-episode character tracking (speaker fingerprints).
 # Omit and the multi-voice script falls back to per-line pitch buckets.
-& $V -m pip install resemblyzer
+# resemblyzer needs webrtcvad, which has NO prebuilt wheel for py3.12 and tries
+# to compile (fails without MS C++ Build Tools). Use the prebuilt drop-in
+# webrtcvad-wheels, then install resemblyzer with --no-deps (its other deps -
+# numpy/scipy/librosa/torch - already came from coqui-tts + torch above).
+& $V -m pip install webrtcvad-wheels
+& $V -m pip install --no-deps resemblyzer
+& $V -c "from resemblyzer import VoiceEncoder, preprocess_wav; print('resemblyzer OK')"
 
 # confirm 5080 is visible
 & $V -c "import torch, torchaudio, transformers, numpy; from TTS.api import TTS; print('ALL OK', torch.__version__, 'cuda', torch.cuda.is_available(), '| tf', transformers.__version__)"

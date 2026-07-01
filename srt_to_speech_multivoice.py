@@ -226,9 +226,28 @@ def cosine(a, b):
     return float(np.dot(a, b) / (na * nb))
 
 
+def _shim_scipy_morphology():
+    """resemblyzer 0.1.4 imports scipy.ndimage.morphology, which SciPy >=1.14
+    removed. Re-expose it from scipy.ndimage so the import keeps working."""
+    import sys
+    import types
+    if "scipy.ndimage.morphology" in sys.modules:
+        return
+    try:
+        import scipy.ndimage as ndi
+    except ModuleNotFoundError:
+        return
+    if not hasattr(ndi, "binary_dilation"):
+        return
+    mod = types.ModuleType("scipy.ndimage.morphology")
+    mod.binary_dilation = ndi.binary_dilation
+    sys.modules["scipy.ndimage.morphology"] = mod
+
+
 def make_encoder(device):
     """Load resemblyzer's speaker encoder, or None if unavailable."""
     try:
+        _shim_scipy_morphology()
         from resemblyzer import VoiceEncoder
     except ModuleNotFoundError:
         print("[tts] WARNING: resemblyzer not installed - no cross-episode "
