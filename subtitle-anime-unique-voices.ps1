@@ -244,7 +244,11 @@ function Copy-WithProgress {
     Write-Host "  $Label ($sizeMB MB)..."
     Write-Verbose "    $Source -> $Destination"
     $sw = [Diagnostics.Stopwatch]::StartNew()
-    Copy-Item -LiteralPath $Source -Destination $Destination -Force
+    # Use the .NET API, not Copy-Item: these filenames contain [brackets], which
+    # Copy-Item's -Destination treats as wildcards (there is no -LiteralPath for
+    # the destination). Over a UNC share that glob fails to resolve and throws
+    # "Could not find a part of the path". File.Copy is fully literal + UNC-safe.
+    [System.IO.File]::Copy($Source, $Destination, $true)
     $sw.Stop()
     $secs = [math]::Max($sw.Elapsed.TotalSeconds, 0.001)
     Write-Verbose ("    copied in {0:n1}s ({1:n1} MB/s)" -f $secs, ($sizeMB / $secs))
@@ -422,7 +426,9 @@ function Invoke-Episode {
         $partFile = "$outFile.part"
         if (Test-Path -LiteralPath $partFile) { Remove-Item -LiteralPath $partFile -Force }
         Copy-WithProgress -Source $localOut -Destination $partFile -Label "copy result back" | Out-Null
-        Move-Item -LiteralPath $partFile -Destination $outFile -Force
+        # .NET Move, not Move-Item: bracketed $outFile would be glob-parsed by
+        # Move-Item's -Destination (same bug as the copy above).
+        [System.IO.File]::Move($partFile, $outFile, $true)
 
         $epSw.Stop()
         Write-Host ("  done in {0:n1}s -> {1}" -f $epSw.Elapsed.TotalSeconds, $outFile) -ForegroundColor Green
@@ -439,9 +445,7 @@ function Invoke-Episode {
 if (-not (Test-Path -LiteralPath $Folder)) { throw "Folder not found: $Folder" }
 if (-not (Test-Path -LiteralPath $TTS_SCRIPT)) { throw "Missing TTS helper: $TTS_SCRIPT" }
 if (-not (Test-Path -LiteralPath $Scratch)) { throw "Scratch folder not found: $Scratch" }
-if (-not (Test-Path -LiteralPath $OutputDir)) {
-    New-Item -ItemType Directory -Path $OutputDir | Out-Null
-}
+[System.IO.Directory]::CreateDirectory($OutputDir) | Out-Null
 
 # Report scratch location + free space so a full/wrong drive is obvious up front.
 $scratchRoot = [IO.Path]::GetPathRoot((Resolve-Path -LiteralPath $Scratch).Path)
