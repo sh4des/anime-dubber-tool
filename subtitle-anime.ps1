@@ -346,7 +346,13 @@ if (-not (Test-Path -LiteralPath $Scratch)) { throw "Scratch folder not found: $
 if (-not (Test-Path -LiteralPath $OutputDir)) {
     New-Item -ItemType Directory -Path $OutputDir | Out-Null
 }
-Write-Verbose "Local scratch: $Scratch"
+
+# Report scratch location + free space so a full/wrong drive is obvious up front.
+$scratchRoot = [IO.Path]::GetPathRoot((Resolve-Path -LiteralPath $Scratch).Path)
+$freeGB = try {
+    [math]::Round((Get-PSDrive -Name $scratchRoot.TrimEnd(':\')).Free / 1GB, 1)
+} catch { "?" }
+Write-Host "Local scratch: $Scratch  (drive $scratchRoot, $freeGB GB free)"
 
 $episodes = @(
     Get-ChildItem -LiteralPath $Folder -File |
