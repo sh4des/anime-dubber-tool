@@ -20,6 +20,9 @@
 # -----------------------------------------------------------------------------
 # Requires (on PATH or set the *_EXE vars below):
 #   ffmpeg, ffprobe   (https://www.gyan.dev/ffmpeg/builds/)
+#   mkvmerge          (MKVToolNix - remuxes each source into a clean container
+#                      first; ffmpeg's demuxer aborts partway through some
+#                      otherwise-playable MKVs and silently truncates the dub)
 #   python            (basic deps + `pip install resemblyzer` for cross-episode
 #                      character tracking; pitch detection reuses torchaudio)
 # Usage:
@@ -86,7 +89,16 @@ param(
     # Python interpreter to run the TTS helper. Point at a venv to avoid global
     # dependency conflicts, e.g.
     #   -Python "G:\Transcode\.venv-dub\Scripts\python.exe"
-    [string]$Python = "python"
+    [string]$Python = "python",
+
+    # mkvmerge (MKVToolNix) binary. Each source is remuxed into a clean Matroska
+    # container before processing: ffmpeg's demuxer aborts on some slightly
+    # malformed-but-playable MKVs ("invalid as first byte of an EBML number")
+    # and silently truncates the episode to a few minutes; mkvmerge is far more
+    # tolerant and rewrites clean structure without re-encoding. Point at the
+    # binary if it isn't on PATH, e.g.
+    #   -Mkvmerge "C:\Program Files\MKVToolNix\mkvmerge.exe"
+    [string]$Mkvmerge = "mkvmerge"
 )
 
 $ErrorActionPreference = "Stop"
@@ -102,6 +114,14 @@ if (-not $PSBoundParameters.ContainsKey('Python')) {
     if (Test-Path -LiteralPath $venvPy) { $Python = $venvPy }
 }
 $PYTHON  = $Python
+# mkvmerge: prefer an explicit -Mkvmerge, else PATH, else the default install dir.
+if (-not $PSBoundParameters.ContainsKey('Mkvmerge')) {
+    if (-not (Get-Command $Mkvmerge -ErrorAction SilentlyContinue)) {
+        $defaultMkv = Join-Path ${env:ProgramFiles} "MKVToolNix\mkvmerge.exe"
+        if (Test-Path -LiteralPath $defaultMkv) { $Mkvmerge = $defaultMkv }
+    }
+}
+$MKVMERGE = $Mkvmerge
 $TTS_SCRIPT = Join-Path $PSScriptRoot "srt_to_speech_multivoice.py"
 
 # ffmpeg log level: 'info' shows what it's doing without the per-frame firehose.
@@ -151,6 +171,60 @@ function Invoke-FFProbeJson {
 function Get-VideoDuration {
     param($Probe)
     [double]$Probe.format.duration
+}
+
+# Read a media file's container duration in seconds (0.0 if unknown). Used to
+# verify a remux/extraction produced a full-length file, not a truncated stub.
+function Get-MediaDuration {
+    param([string]$Path)
+    $d = & $FFPROBE -v error -show_entries format=duration -of csv=p=0 -- "$Path"
+    if ($LASTEXITCODE -ne 0 -or -not $d) { return 0.0 }
+    return [double]$d
+}
+
+# End time (seconds) of the last cue in an .srt. If dialogue stops long before
+# the episode ends, the subs (and thus the dub) are probably truncated.
+function Get-LastCueSeconds {
+    param([string]$Srt)
+    $last = 0.0
+    Select-String -LiteralPath $Srt -Pattern '-->\s*(\d\d):(\d\d):(\d\d),(\d\d\d)' -AllMatches |
+        ForEach-Object { $_.Matches } | ForEach-Object {
+            $g = $_.Groups
+            $s = [int]$g[1].Value * 3600 + [int]$g[2].Value * 60 + [int]$g[3].Value + [int]$g[4].Value / 1000.0
+            if ($s -gt $last) { $last = $s }
+        }
+    return $last
+}
+
+# Remux the local source into a clean Matroska container with mkvmerge and
+# verify it is full-length. ffmpeg's Matroska demuxer aborts partway through
+# some otherwise-playable files ("invalid as first byte of an EBML number") and
+# hands downstream steps a silently truncated episode - the dub then goes silent
+# after a few minutes. mkvmerge rewrites clean structure (no re-encode, so it's
+# fast and lossless) and preserves track order, so the subtitle/audio relative
+# indices computed from the original probe stay valid. Returns the remuxed path;
+# throws if mkvmerge can't recover the full duration (genuinely damaged media
+# that must be re-acquired - no mux flag fixes missing data).
+function Repair-Container {
+    param([string]$InVideo, [string]$WorkDir, [string]$Base, [double]$HeaderDuration)
+
+    $fixed = Join-Path $WorkDir "$Base.remux.mkv"
+    $mkArgs = @("-o", $fixed, "--", $InVideo)
+    Write-Cmd $MKVMERGE $mkArgs
+    & $MKVMERGE @mkArgs
+    # mkvmerge exit codes: 0 = ok, 1 = warnings (output still valid), 2 = fatal.
+    if ($LASTEXITCODE -ge 2 -or -not (Test-Path -LiteralPath $fixed)) {
+        throw "mkvmerge remux failed for $InVideo"
+    }
+
+    $fixedDur = Get-MediaDuration $fixed
+    Write-Verbose ("  remuxed duration: {0:n0}s (source header {1:n0}s)" -f $fixedDur, $HeaderDuration)
+    if ($HeaderDuration -gt 0 -and $fixedDur -lt ($HeaderDuration * 0.98)) {
+        throw ("remux recovered only {0:n0}s of {1:n0}s - source media is damaged past what mkvmerge can rebuild; re-acquire this file." -f $fixedDur, $HeaderDuration)
+    }
+    # Drop the unrepaired copy; everything downstream uses the remux.
+    Remove-Item -LiteralPath $InVideo -Force -ErrorAction SilentlyContinue
+    return $fixed
 }
 
 # Decide where this episode's English subtitles will come from, WITHOUT reading
@@ -385,14 +459,14 @@ function Invoke-Episode {
         return $true
     }
 
-    Write-Host "  [1/7] probing source"
+    Write-Host "  [1/8] probing source"
     $probe = Invoke-FFProbeJson -Path $Video
     $dur = Get-VideoDuration $probe
     Write-Verbose ("  duration: {0:n0}s ({1:hh\:mm\:ss})" -f $dur, [TimeSpan]::FromSeconds($dur))
 
     # Decide subtitle source over the network first - if there's nothing usable,
     # bail before copying gigabytes we'd only throw away.
-    Write-Host "  [2/7] locating subtitles"
+    Write-Host "  [2/8] locating subtitles"
     $plan = Get-SubtitlePlan -Video $Video -Probe $probe
     if (-not $plan) {
         Write-Warning "  no usable subtitles, skipping (no copy made)."
@@ -406,23 +480,53 @@ function Invoke-Episode {
     try {
         # Copy the source to local disk so extraction + mux don't stream it over
         # the network repeatedly.
-        Write-Host "  [3/7] copying source to local scratch"
+        Write-Host "  [3/8] copying source to local scratch"
         $localVideo = Join-Path $work ([IO.Path]::GetFileName($Video))
         Copy-WithProgress -Source $Video -Destination $localVideo -Label "copy source local" | Out-Null
 
-        Write-Host "  [4/7] extracting subtitles"
+        # Remux into a clean container BEFORE any ffmpeg extraction. Without this,
+        # ffmpeg aborts demuxing at the first malformed EBML element and every
+        # step below silently stops there (truncated subs, short ref audio, a dub
+        # that goes quiet after a few minutes). $dur here is the source header
+        # duration probed in step 1 - the length we expect to recover.
+        Write-Host "  [4/8] remuxing container (mkvmerge) to repair demuxable length"
+        $localVideo = Repair-Container -InVideo $localVideo -WorkDir $work -Base $base -HeaderDuration $dur
+        # Re-probe the clean local file: its header duration is now trustworthy
+        # and its stream layout is exactly what the mux (step 8) will see.
+        $probe = Invoke-FFProbeJson -Path $localVideo
+        $dur   = Get-VideoDuration $probe
+        Write-Verbose ("  duration after remux: {0:n0}s ({1:hh\:mm\:ss})" -f $dur, [TimeSpan]::FromSeconds($dur))
+
+        Write-Host "  [5/8] extracting subtitles"
         $srt = Export-Subtitle -Plan $plan -ExtractFrom $localVideo -WorkDir $work -Base $base
         if (-not $srt) { return $false }
+        # Coverage sanity check: if dialogue cues stop well before the episode
+        # ends it usually means truncated subs (the bug this remux step exists to
+        # dodge). Warn rather than fail - some episodes legitimately close on a
+        # long silent action beat or credits with no dialogue.
+        $lastCue = Get-LastCueSeconds $srt
+        if ($dur -gt 0 -and $lastCue -gt 0 -and $lastCue -lt ($dur * 0.8)) {
+            Write-Warning ("  subtitle coverage looks short: last cue at {0:n0}s of {1:n0}s ({2:n0}%). Verify the dub isn't truncated." -f $lastCue, $dur, (100 * $lastCue / $dur))
+        }
 
-        Write-Host "  [5/7] extracting reference audio (for voice classification)"
+        Write-Host "  [6/8] extracting reference audio (for voice classification)"
         $refWav = Export-ReferenceAudio -ExtractFrom $localVideo -WorkDir $work -Base $base
         if (-not $refWav) { return $false }
+        # Hard guard: the ref WAV is a full decode of the original audio track,
+        # so its length is a direct measure of how far the container demuxes
+        # (independent of where dialogue happens). If it comes back far shorter
+        # than the episode, decoding is still truncating and the dub would be
+        # silent past that point - fail loudly instead of shipping a partial dub.
+        $refDur = Get-MediaDuration $refWav
+        if ($dur -gt 0 -and $refDur -lt ($dur * 0.95)) {
+            throw ("audio still truncates at {0:n0}s of {1:n0}s after remux - refusing to ship a partial dub." -f $refDur, $dur)
+        }
 
-        Write-Host "  [6/7] generating multi-voice English dub (TTS)"
+        Write-Host "  [7/8] generating multi-voice English dub (TTS)"
         $dubWav = Join-Path $work "$base.dub.wav"
         New-DubTrack -Srt $srt -RefAudio $refWav -Duration $dur -OutWav $dubWav
 
-        Write-Host "  [7/7] muxing tracks (local)"
+        Write-Host "  [8/8] muxing tracks (local)"
         $localOut = Join-Path $work "$base.dubbed.mkv"
         Merge-DubIntoVideo -Video $localVideo -DubWav $dubWav -Probe $probe -OutVideo $localOut -WorkDir $work
 
@@ -452,6 +556,9 @@ function Invoke-Episode {
 if (-not (Test-Path -LiteralPath $Folder)) { throw "Folder not found: $Folder" }
 if (-not (Test-Path -LiteralPath $TTS_SCRIPT)) { throw "Missing TTS helper: $TTS_SCRIPT" }
 if (-not (Test-Path -LiteralPath $Scratch)) { throw "Scratch folder not found: $Scratch" }
+if (-not (Get-Command $MKVMERGE -ErrorAction SilentlyContinue) -and -not (Test-Path -LiteralPath $MKVMERGE)) {
+    throw "mkvmerge not found ('$MKVMERGE'). Install MKVToolNix (choco install mkvtoolnix) or pass -Mkvmerge <path>."
+}
 [System.IO.Directory]::CreateDirectory($OutputDir) | Out-Null
 
 # Report scratch location + free space so a full/wrong drive is obvious up front.
@@ -461,6 +568,7 @@ $freeGB = try {
 } catch { "?" }
 Write-Host "Local scratch: $Scratch  (drive $scratchRoot, $freeGB GB free)"
 Write-Host "Python: $PYTHON"
+Write-Host "mkvmerge: $MKVMERGE (remux/repair each source before processing)"
 $profileState = if (Test-Path -LiteralPath $ProfilePath) { "existing" } else { "new" }
 Write-Host "Character profile: $ProfilePath ($profileState, match>=$MatchThreshold)"
 Write-Host ("Pitch buckets for new characters (Hz): male<$MaleMax, adultF<$AdultFemaleMax, " +
