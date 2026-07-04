@@ -209,18 +209,45 @@ function Repair-Container {
     param([string]$InVideo, [string]$WorkDir, [string]$Base, [double]$HeaderDuration)
 
     $fixed = Join-Path $WorkDir "$Base.remux.mkv"
+    $tooShort = { param($d) $HeaderDuration -gt 0 -and $d -lt ($HeaderDuration * 0.98) }
+
+    # --- attempt 1: mkvmerge (cleanest structural rebuild, lossless) ----------
     $mkArgs = @("-o", $fixed, "--", $InVideo)
     Write-Cmd $MKVMERGE $mkArgs
-    & $MKVMERGE @mkArgs
+    # Capture output so mkvmerge's actual complaint is visible (and so its exit
+    # code doesn't trip $PSNativeCommandUseErrorActionPreference). 2>&1 folds
+    # stderr in; the records stringify fine for display.
+    $mkOut  = & $MKVMERGE @mkArgs 2>&1
+    $mkCode = $LASTEXITCODE
+    $mkOut | ForEach-Object { Write-Host "    $_" -ForegroundColor DarkGray }
     # mkvmerge exit codes: 0 = ok, 1 = warnings (output still valid), 2 = fatal.
-    if ($LASTEXITCODE -ge 2 -or -not (Test-Path -LiteralPath $fixed)) {
-        throw "mkvmerge remux failed for $InVideo"
+    $mkOk = ($mkCode -lt 2) -and (Test-Path -LiteralPath $fixed) -and -not (& $tooShort (Get-MediaDuration $fixed))
+    if (-not $mkOk) {
+        Write-Warning "  mkvmerge did not produce a full-length remux (exit $mkCode); falling back to ffmpeg stream-copy remux."
+    }
+
+    # --- attempt 2: tolerant ffmpeg stream copy -------------------------------
+    # Stream copy (no decode) parses far fewer bytes than the decode path that
+    # truncated the original run, and +discardcorrupt/ignore_err let it skip bad
+    # packets instead of aborting. Different failure mode than mkvmerge, so it's
+    # worth a second shot before giving up on the file.
+    if (-not $mkOk) {
+        Remove-Item -LiteralPath $fixed -Force -ErrorAction SilentlyContinue
+        $ffArgs = @("-y", "-v", $FF_LOGLEVEL, "-stats",
+                    "-fflags", "+genpts+discardcorrupt", "-err_detect", "ignore_err",
+                    "-i", $InVideo, "-map", "0", "-c", "copy",
+                    "-max_interleave_delta", "0", $fixed)
+        Write-Cmd $FFMPEG $ffArgs
+        & $FFMPEG @ffArgs
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $fixed)) {
+            throw "both mkvmerge and ffmpeg failed to remux $InVideo (see output above)"
+        }
     }
 
     $fixedDur = Get-MediaDuration $fixed
     Write-Verbose ("  remuxed duration: {0:n0}s (source header {1:n0}s)" -f $fixedDur, $HeaderDuration)
-    if ($HeaderDuration -gt 0 -and $fixedDur -lt ($HeaderDuration * 0.98)) {
-        throw ("remux recovered only {0:n0}s of {1:n0}s - source media is damaged past what mkvmerge can rebuild; re-acquire this file." -f $fixedDur, $HeaderDuration)
+    if (& $tooShort $fixedDur) {
+        throw ("remux recovered only {0:n0}s of {1:n0}s - source media is damaged past what remuxing can rebuild; re-acquire this file." -f $fixedDur, $HeaderDuration)
     }
     # Drop the unrepaired copy; everything downstream uses the remux.
     Remove-Item -LiteralPath $InVideo -Force -ErrorAction SilentlyContinue
