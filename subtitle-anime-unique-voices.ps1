@@ -212,7 +212,9 @@ function Repair-Container {
     $tooShort = { param($d) $HeaderDuration -gt 0 -and $d -lt ($HeaderDuration * 0.98) }
 
     # --- attempt 1: mkvmerge (cleanest structural rebuild, lossless) ----------
-    $mkArgs = @("-o", $fixed, "--", $InVideo)
+    # No "--" separator: mkvmerge treats it as an input filename, not end-of-opts
+    # (our names start with "[", so nothing needs escaping anyway).
+    $mkArgs = @("-o", $fixed, $InVideo)
     Write-Cmd $MKVMERGE $mkArgs
     # Capture output so mkvmerge's actual complaint is visible (and so its exit
     # code doesn't trip $PSNativeCommandUseErrorActionPreference). 2>&1 folds
