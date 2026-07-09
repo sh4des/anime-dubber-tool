@@ -25,8 +25,9 @@
 #   pwsh ./subtitle-anime.ps1 -Folder "..." -Scratch "D:\dub-scratch"  # fast local disk
 #
 # Network shares: the source is copied to -Scratch (local disk, defaults to TEMP),
-# all work happens locally, then the finished file is copied back to <Folder>\dubbed.
-# Make sure -Scratch has room for ~2x one episode (source copy + output).
+# all work happens locally, then the finished file replaces the original episode
+# in place (default). Use -UseDubbedFolder to keep originals and write to
+# <Folder>\dubbed\ instead. Make sure -Scratch has room for ~2x one episode.
 # -----------------------------------------------------------------------------
 
 [CmdletBinding()]
@@ -36,6 +37,14 @@ param(
 
     # Process every episode without the single-episode test/confirm step.
     [switch]$All,
+
+    # Keep originals untouched; write <Folder>\dubbed\<name>.dubbed.mkv instead
+    # of replacing each source file (the old behaviour).
+    [switch]$UseDubbedFolder,
+
+    # Before replacing an episode in-place, copy the original to
+    # <name>.pre-dub.<ext> once (handy if you want a rollback copy on the share).
+    [switch]$BackupOriginal,
 
     # Volume the original audio is mixed down to under the English dub (0.6 = 60%).
     [double]$OriginalVolume = 0.6,
@@ -86,7 +95,10 @@ function Write-Cmd {
 $VideoExtensions = @(".mkv", ".mp4", ".m4v", ".avi", ".ts")
 $TextSubCodecs   = @("subrip", "srt", "ass", "ssa", "mov_text", "webvtt", "text")
 
-# Where finished files go (originals are never modified in place).
+# Written on every AI dub audio track; used to detect completed episodes on re-run.
+$DubTrackTitlePrefix = "English Dub (AI)"
+
+# Where finished files go when -UseDubbedFolder is set.
 $OutputDir = Join-Path $Folder "dubbed"
 
 
@@ -117,6 +129,37 @@ function Invoke-FFProbeJson {
 function Get-VideoDuration {
     param($Probe)
     [double]$Probe.format.duration
+}
+
+# True when the file already has an AI dub track from a previous successful run.
+function Test-HasAiDubTrack {
+    param($Probe)
+    foreach ($s in @($Probe.streams | Where-Object { $_.codec_type -eq "audio" })) {
+        $title = $s.tags.title
+        if ($title -and $title.StartsWith($DubTrackTitlePrefix)) { return $true }
+    }
+    return $false
+}
+
+# Remove stale transfer files left by an interrupted copy/replace on the share.
+function Clear-StaleTransferArtifacts {
+    param([string]$Video)
+    $ext = [IO.Path]::GetExtension($Video)
+    $staging = "$Video.replacing$ext"
+    $part = "$Video.part"
+
+    if (-not (Test-Path -LiteralPath $Video) -and (Test-Path -LiteralPath $staging)) {
+        Write-Warning "  recovering original from incomplete replace: $staging -> $Video"
+        [System.IO.File]::Move($staging, $Video, $true)
+    }
+    elseif ((Test-Path -LiteralPath $Video) -and (Test-Path -LiteralPath $staging)) {
+        Write-Verbose "  removing leftover staging file: $staging"
+        Remove-Item -LiteralPath $staging -Force
+    }
+    if (Test-Path -LiteralPath $part) {
+        Write-Verbose "  removing stale partial upload: $part"
+        Remove-Item -LiteralPath $part -Force
+    }
 }
 
 # Decide where this episode's English subtitles will come from, WITHOUT reading
@@ -195,7 +238,8 @@ function Copy-WithProgress {
     Write-Host "  $Label ($sizeMB MB)..."
     Write-Verbose "    $Source -> $Destination"
     $sw = [Diagnostics.Stopwatch]::StartNew()
-    Copy-Item -LiteralPath $Source -Destination $Destination -Force
+    # .NET API, not Copy-Item: bracketed filenames are literal over UNC shares.
+    [System.IO.File]::Copy($Source, $Destination, $true)
     $sw.Stop()
     $secs = [math]::Max($sw.Elapsed.TotalSeconds, 0.001)
     Write-Verbose ("    copied in {0:n1}s ({1:n1} MB/s)" -f $secs, ($sizeMB / $secs))
@@ -310,21 +354,95 @@ function Merge-DubIntoVideo {
     Write-Verbose ("  mux finished in {0:n1}s -> {1} ({2} MB)" -f $sw.Elapsed.TotalSeconds, $OutVideo, $sizeMB)
 }
 
+# Push a fully-built local file to its final location. For in-place mode the
+# original is moved aside only after the .part copy is size- and ffprobe-verified,
+# so a network drop during the upload never truncates the episode on the share.
+function Install-DubbedEpisode {
+    param([string]$LocalOut, [string]$Video, [string]$Base)
+
+    if ($UseDubbedFolder) {
+        [System.IO.Directory]::CreateDirectory($OutputDir) | Out-Null
+        $outFile = Join-Path $OutputDir "$Base.dubbed.mkv"
+    }
+    else {
+        $outFile = $Video
+    }
+
+    $partFile = "$outFile.part"
+    if (Test-Path -LiteralPath $partFile) { Remove-Item -LiteralPath $partFile -Force }
+
+    $destLabel = if ($UseDubbedFolder) { "copy result to $OutputDir" } else { "copy result in-place" }
+    Copy-WithProgress -Source $LocalOut -Destination $partFile -Label $destLabel | Out-Null
+
+    $expectedLen = (Get-Item -LiteralPath $LocalOut).Length
+    $gotLen = (Get-Item -LiteralPath $partFile).Length
+    if ($gotLen -ne $expectedLen) {
+        Remove-Item -LiteralPath $partFile -Force -ErrorAction SilentlyContinue
+        throw "transfer size mismatch ($gotLen vs $expectedLen bytes) - original untouched"
+    }
+
+    $partProbe = Invoke-FFProbeJson -Path $partFile
+    if (-not (Test-HasAiDubTrack $partProbe)) {
+        Remove-Item -LiteralPath $partFile -Force -ErrorAction SilentlyContinue
+        throw "uploaded file is missing the AI dub track marker - original untouched"
+    }
+
+    if ($UseDubbedFolder) {
+        [System.IO.File]::Move($partFile, $outFile, $true)
+        return $outFile
+    }
+
+    $ext = [IO.Path]::GetExtension($Video)
+    $bakFile = "$Video.pre-dub$ext"
+    $staging = "$Video.replacing$ext"
+
+    if ($BackupOriginal -and -not (Test-Path -LiteralPath $bakFile)) {
+        Copy-WithProgress -Source $Video -Destination $bakFile -Label "backup original" | Out-Null
+    }
+
+    if (Test-Path -LiteralPath $staging) { Remove-Item -LiteralPath $staging -Force }
+    [System.IO.File]::Move($Video, $staging, $true)
+    try {
+        [System.IO.File]::Move($partFile, $Video, $false)
+    }
+    catch {
+        if (-not (Test-Path -LiteralPath $Video) -and (Test-Path -LiteralPath $staging)) {
+            [System.IO.File]::Move($staging, $Video, $true)
+        }
+        throw
+    }
+    Remove-Item -LiteralPath $staging -Force -ErrorAction SilentlyContinue
+    return $Video
+}
+
 # Full pipeline for one episode. Returns $true on success, $false if skipped.
 function Invoke-Episode {
     param([string]$Video)
 
     Write-Host "`n=== $([IO.Path]::GetFileName($Video)) ===" -ForegroundColor Cyan
     $epSw = [Diagnostics.Stopwatch]::StartNew()
-    $base    = [IO.Path]::GetFileNameWithoutExtension($Video)
-    $outFile = Join-Path $OutputDir "$base.dubbed.mkv"
-    if (Test-Path -LiteralPath $outFile) {
-        Write-Host "  already done, skipping."
-        return $true
-    }
+    $base = [IO.Path]::GetFileNameWithoutExtension($Video)
+    Clear-StaleTransferArtifacts -Video $Video
 
     Write-Host "  [1/6] probing source"
     $probe = Invoke-FFProbeJson -Path $Video
+    if (Test-HasAiDubTrack $probe) {
+        Write-Host "  already has AI dub track, skipping."
+        return $true
+    }
+    if ($UseDubbedFolder) {
+        $legacyOut = Join-Path $OutputDir "$base.dubbed.mkv"
+        if (Test-Path -LiteralPath $legacyOut) {
+            Write-Host "  already done, skipping (output in $OutputDir)."
+            return $true
+        }
+    }
+    $legacyBeside = Join-Path ([IO.Path]::GetDirectoryName($Video)) "$base.dubbed.mkv"
+    if (Test-Path -LiteralPath $legacyBeside) {
+        Write-Host "  legacy dubbed copy beside source, skipping ($([IO.Path]::GetFileName($legacyBeside)))."
+        return $true
+    }
+
     $dur = Get-VideoDuration $probe
     Write-Verbose ("  duration: {0:n0}s ({1:hh\:mm\:ss})" -f $dur, [TimeSpan]::FromSeconds($dur))
 
@@ -360,14 +478,8 @@ function Invoke-Episode {
         $localOut = Join-Path $work "$base.dubbed.mkv"
         Merge-DubIntoVideo -Video $localVideo -DubWav $dubWav -Probe $probe -OutVideo $localOut -WorkDir $work
 
-        # Only now, after a fully successful local build, push the result back.
-        # Copy to a .part file and rename on success, so an interrupted transfer
-        # never leaves a truncated file that later looks "already done".
-        Write-Host "  copying result back to $OutputDir"
-        $partFile = "$outFile.part"
-        if (Test-Path -LiteralPath $partFile) { Remove-Item -LiteralPath $partFile -Force }
-        Copy-WithProgress -Source $localOut -Destination $partFile -Label "copy result back" | Out-Null
-        Move-Item -LiteralPath $partFile -Destination $outFile -Force
+        Write-Host "  installing dubbed episode"
+        $outFile = Install-DubbedEpisode -LocalOut $localOut -Video $Video -Base $base
 
         $epSw.Stop()
         Write-Host ("  done in {0:n1}s -> {1}" -f $epSw.Elapsed.TotalSeconds, $outFile) -ForegroundColor Green
@@ -384,9 +496,6 @@ function Invoke-Episode {
 if (-not (Test-Path -LiteralPath $Folder)) { throw "Folder not found: $Folder" }
 if (-not (Test-Path -LiteralPath $TTS_SCRIPT)) { throw "Missing TTS helper: $TTS_SCRIPT" }
 if (-not (Test-Path -LiteralPath $Scratch)) { throw "Scratch folder not found: $Scratch" }
-if (-not (Test-Path -LiteralPath $OutputDir)) {
-    New-Item -ItemType Directory -Path $OutputDir | Out-Null
-}
 
 # Report scratch location + free space so a full/wrong drive is obvious up front.
 $scratchRoot = [IO.Path]::GetPathRoot((Resolve-Path -LiteralPath $Scratch).Path)
@@ -395,10 +504,16 @@ $freeGB = try {
 } catch { "?" }
 Write-Host "Local scratch: $Scratch  (drive $scratchRoot, $freeGB GB free)"
 Write-Host "Python: $PYTHON"
+$outputMode = if ($UseDubbedFolder) { "separate folder: $OutputDir" } else { "in-place (replace source)" }
+Write-Host "Output mode: $outputMode$(if ($BackupOriginal -and -not $UseDubbedFolder) { ' + .pre-dub backup' })"
 
 $episodes = @(
     Get-ChildItem -LiteralPath $Folder -File |
         Where-Object { $VideoExtensions -contains $_.Extension.ToLower() } |
+        Where-Object { $_.Name -notlike "*.dubbed.mkv" } |
+        Where-Object { $_.Name -notlike "*.pre-dub.*" } |
+        Where-Object { $_.Name -notlike "*.replacing.*" } |
+        Where-Object { $_.Name -notlike "*.part" } |
         Sort-Object Name
 )
 if ($episodes.Count -eq 0) { throw "No video files found in $Folder" }
@@ -434,4 +549,5 @@ foreach ($ep in $remaining) {
         $skipped++
     }
 }
-Write-Host "`nFinished. Dubbed: $done, skipped: $skipped. Output in $OutputDir"
+$outWhere = if ($UseDubbedFolder) { $OutputDir } else { $Folder }
+Write-Host "`nFinished. Dubbed: $done, skipped: $skipped. Output: $outWhere"
