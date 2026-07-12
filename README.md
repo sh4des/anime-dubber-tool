@@ -19,128 +19,148 @@ $V = "G:\Transcode\.venv-dub\Scripts\python.exe"
 & $V -m pip install --no-deps resemblyzer
 & $V -c "from resemblyzer import VoiceEncoder, preprocess_wav; print('resemblyzer OK')"
 
+# variant 3 (RECOMMENDED cloned pipeline): source separation + speaker embeddings.
+#   demucs      - isolates the dialogue (vocal) stem from music/SFX
+#   speechbrain - ECAPA speaker embeddings for diarization/clustering (no signup;
+#                 downloads weights anonymously, all inference local)
+& $V -m pip install demucs speechbrain
+& $V -c "import demucs, speechbrain; print('demucs + speechbrain OK')"
+
 # confirm 5080 is visible
 & $V -c "import torch, torchaudio, transformers, numpy; from TTS.api import TTS; print('ALL OK', torch.__version__, 'cuda', torch.cuda.is_available(), '| tf', transformers.__version__)"
 
 
-# run script
-$env:TTS_HOME = "G:\Transcode\tts-cache"
-# The multi-voice script also downloads a ~1GB speech age+gender model
-# (audeering/wav2vec2-large-robust-24-ft-age-gender) on first run - it needs
-# internet once, then caches. Relocate that cache off C: with:
-$env:HF_HOME  = "G:\Transcode\hf-cache"
+# =============================================================================
+# run script  (env + shared args - used by every variant below)
+# =============================================================================
+$env:TTS_HOME = "G:\Transcode\tts-cache"   # XTTS model cache off C:
+$env:HF_HOME  = "G:\Transcode\hf-cache"    # HuggingFace cache: age+gender model
+                                           # (~1GB), Demucs, ECAPA - all download
+                                           # weights ONCE, then run locally.
 
-$Show = "\\10.0.23.105\media\TV\15-18 Animated\Mobile Suit Gundam ZZ"
+$Show = "\\10.0.23.105\media\tv\15-18 Animated\Mobile Suit Gundam ZZ"
 $DubArgs = @{
     Folder  = $Show
     Scratch = "G:\Transcode"
     Python  = "G:\Transcode\.venv-dub\Scripts\python.exe"
 }
 
-# Default output: in-place replace. Each episode is built on local scratch, then
-# copied back and swapped over the original (same filename for Plex). Re-runs
-# skip episodes that already have an "English Dub (AI)" audio track. Use -All to
-# skip the single-episode test prompt and process the whole folder.
-#
-# Options:
-#   -All                 process every episode (no test/confirm step)
-#   -BackupOriginal      keep <name>.pre-dub.<ext> before replacing (rollback copy)
-#   -UseDubbedFolder     old behaviour: write to <Folder>\dubbed\ instead of replacing
-
-# --- variant 1: basic, single voice for every line ---------------------------
-pwsh ./subtitle-anime.ps1 @DubArgs -All
-
-# with a rollback copy of each original before replace:
-# pwsh ./subtitle-anime.ps1 @DubArgs -All -BackupOriginal
-
-# keep originals untouched; write dubbed copies to <Folder>\dubbed\ instead:
-# pwsh ./subtitle-anime.ps1 @DubArgs -All -UseDubbedFolder
-
-# --- variant 3 (RECOMMENDED): cloned voices, whole show, one command ---------
-# Clone each character's ACTUAL (Japanese) voice instead of picking one from a
-# pool. Two phases, both local / no signups (Demucs + SpeechBrain ECAPA + XTTS
-# download weights anonymously; no audio leaves the machine):
-#   PHASE A  profile the whole show  -> anime-dub-profile.json + reference clips
-#   PHASE B  dub every episode by cloning each character from that profile
-# The orchestrator runs both. Safe to re-run (profiling overwrites; dubbing is
-# -Redub + resume-safe: it skips episodes already rebuilt with the cloned engine,
-# so an interrupted run just continues). Needs: pip install demucs speechbrain
-#   pwsh ./subtitle-anime-dub-show.ps1 @DubArgs
-#   pwsh ./subtitle-anime-dub-show.ps1 @DubArgs -BackupOriginal   # rollback copies
-#   pwsh ./subtitle-anime-dub-show.ps1 @DubArgs -SkipProfile      # reuse profile
-# Or run the phases yourself:
-#   pwsh ./subtitle-anime-profile.ps1 @DubArgs -Diarizer ecapa            # Phase A
-#   pwsh ./subtitle-anime-unique-voices.ps1 @DubArgs -Clone -Redub -All   # Phase B
-# Profiling the FULL show (no -MaxEpisodes) is best: it discovers the whole cast
-# and lets every episode dub via the fast, accurate time-overlap path.
+# Output is in-place by default: each episode is built on local scratch, then
+# copied back and swapped over the original (same filename, so Plex keeps its
+# entry). The original audio + subs are preserved inside; only an English dub
+# track is added and set default. Common options (all variants):
+#   -All                 process every episode (skip the single-episode prompt)
+#   -BackupOriginal      keep <name>.pre-dub.<ext> before replacing (rollback)
+#   -UseDubbedFolder     write to <Folder>\dubbed\ instead of replacing in place
 
 
-# --- variant 2: unique voice per CHARACTER, tracked across episodes ----------
-# Fingerprints the original Japanese speech under each line, matches it to the
-# show's recurring characters, and gives each character their own consistent
-# voice for the whole series. State lives in <Folder>\anime-dub-voices.json
-# (delete it to reset the cast). Each new character's GENDER + AGE is read from a
-# pretrained speech age+gender model over its original audio, which picks a
-# bucket (child / adult / elderly x male / female) and a distinct voice from that
-# pool. (Median pitch is only a fallback if the model is off/unavailable.)
+# =============================================================================
+# variant 3 (RECOMMENDED): CLONED voices, whole show, one command
+# =============================================================================
+# Clone each character's ACTUAL (Japanese) voice instead of assigning one from a
+# pool - the English line inherits the source timbre. Fully local, no signups
+# (Demucs + SpeechBrain ECAPA + XTTS download weights anonymously; no audio ever
+# leaves the machine). Two phases, run by one orchestrator:
+#   PHASE A  profile the WHOLE show  -> <Folder>\anime-dub-profile.json,
+#            a QC report (.qc.txt), and reference clips in <Folder>\anime-dub-clips\
+#   PHASE B  dub every episode by cloning each character from that profile;
+#            cues are matched to a character by time-overlap (profiled episodes)
+#            or by embedding, with a pool-voice fallback for weak matches.
+# Safe to re-run: profiling overwrites the profile; dubbing is -Redub and
+# resume-safe (skips episodes already rebuilt with the cloned track), so an
+# interrupted run just continues.
+
+# whole series, end to end (profile all -> clone-dub all):
+pwsh ./subtitle-anime-dub-show.ps1 @DubArgs
+
+# with a .pre-dub rollback copy of each original:
+# pwsh ./subtitle-anime-dub-show.ps1 @DubArgs -BackupOriginal
+
+# reuse an existing profile (skip Phase A), just (re)dub:
+# pwsh ./subtitle-anime-dub-show.ps1 @DubArgs -SkipProfile
+
+# same thing, phases run by hand (equivalent to the orchestrator):
+#   pwsh ./subtitle-anime-profile.ps1        @DubArgs -Diarizer ecapa          # Phase A (all eps)
+#   pwsh ./subtitle-anime-unique-voices.ps1  @DubArgs -Clone -Redub -All -FitToCues  # Phase B
+
+# tune the cast if the QC report looks over/under-split, then re-dub:
+#   pwsh ./subtitle-anime-profile.ps1 @DubArgs -Diarizer ecapa -ReuseStems -ClusterThreshold 0.5
+#   pwsh ./subtitle-anime-unique-voices.ps1 @DubArgs -Clone -Redub -All
+
+
+# =============================================================================
+# variant 2: unique voice per CHARACTER from a POOL (no cloning)
+# =============================================================================
+# Older approach: fingerprint each line's original speech, track the character
+# across episodes, and give them a distinct XTTS pool voice matched by GENDER +
+# AGE (audeering age+gender model; median pitch is only a fallback). State lives
+# in <Folder>\anime-dub-voices.json (delete to reset the cast). Use this if you
+# want clean built-in voices rather than clones.
 # NOTE: a voice is locked when a character is first minted - delete the JSON to
-# re-cast an existing show with the current classifier.
+# re-cast with the current classifier.
 pwsh ./subtitle-anime-unique-voices.ps1 @DubArgs -All
-
-# with rollback copies:
-# pwsh ./subtitle-anime-unique-voices.ps1 @DubArgs -All -BackupOriginal
 
 # tune matching/thresholds per show, e.g.:
 #   pwsh ./subtitle-anime-unique-voices.ps1 @DubArgs -All `
 #        -MatchThreshold 0.78 -ChildSplit 310 -ChildPitchShift 3
-# NOTE: process episodes in order (default sort) on the first pass so characters
-# are discovered consistently; the profile is updated after every episode.
 
-# --- RE-ANALYZE a show you have ALREADY dubbed -------------------------------
-# Episodes dubbed in-place already carry an "English Dub (AI)" track, so a plain
-# re-run skips them; and each character's voice is locked in the profile JSON.
-# To re-analyze from scratch with the current classifier: delete the profile so
-# the cast is re-assigned, then -Redub to reprocess (it strips the previous AI
-# dub track and rebuilds it - lossless, since the original audio is still inside
-# the file and the video is copied, not re-encoded). Process in name order.
+
+# =============================================================================
+# variant 1: basic, single voice for every line
+# =============================================================================
+# No analysis of the original audio - every line uses one XTTS speaker. Fastest.
+pwsh ./subtitle-anime.ps1 @DubArgs -All
+
+# --- RE-ANALYZE / RE-DUB a show you have ALREADY dubbed ----------------------
+# Episodes dubbed in-place already carry an "English Dub (AI)" track. -Redub
+# strips the old AI track and rebuilds it (lossless: the original audio stays in
+# the file, video is copied not re-encoded).
 #
-#   # 1) re-cast: drop the character profile (voices are otherwise locked)
+# Cloned pipeline (variant 3): just re-run the orchestrator. Phase A overwrites
+# the profile; Phase B is -Redub + resume-safe, so it rebuilds every episode:
+#   pwsh ./subtitle-anime-dub-show.ps1 @DubArgs                 # re-profile + re-dub all
+#   pwsh ./subtitle-anime-dub-show.ps1 @DubArgs -SkipProfile    # keep profile, re-dub only
+#
+# Pool pipeline (variant 2): voices are locked in the profile JSON, so to re-cast
+# from scratch delete it first, then -Redub. Process in name order:
 #   Remove-Item -LiteralPath (Join-Path $Show "anime-dub-voices.json") -ErrorAction Ignore
-#   # 2) rebuild every episode with the age+gender voice matching
 #   pwsh ./subtitle-anime-unique-voices.ps1 @DubArgs -All -Redub
-#
-# Omit the Remove-Item to keep the existing cast and only re-render (e.g. after
-# changing -OriginalVolume or -ElderPitchShift). Use -UseDubbedFolder + -Redub to
-# rebuild into <Folder>\dubbed\ instead of replacing in place.
+# Omit the Remove-Item to keep the cast and only re-render. -UseDubbedFolder +
+# -Redub rebuilds into <Folder>\dubbed\ instead of replacing in place.
 
 
 # =============================================================================
 # CLI Reference
 # =============================================================================
 #
-# Four command-line entry points. Two are PowerShell batch orchestrators you run
-# per show folder; each calls a Python TTS helper once per episode. You normally
-# only invoke the PowerShell wrappers - the Python scripts are documented so you
-# can run/debug the TTS step directly on a single .srt.
+# PowerShell orchestrators you run per show folder; each calls a Python helper
+# once per episode. You normally only invoke the PowerShell wrappers - the Python
+# scripts are documented so you can run/debug a single .srt directly.
 #
-#   subtitle-anime.ps1               -> calls srt_to_speech.py            (one voice for all lines)
-#   subtitle-anime-unique-voices.ps1 -> calls srt_to_speech_multivoice.py (one voice per character, tracked across episodes)
+#   subtitle-anime-dub-show.ps1       -> runs Phase A then Phase B (cloned)   [variant 3, RECOMMENDED]
+#   subtitle-anime-profile.ps1        -> calls profile_show.py            (Phase A: build the show voice profile)
+#   subtitle-anime-unique-voices.ps1  -> calls srt_to_speech_cloned.py    (Phase B, with -Clone)
+#                                     -> calls srt_to_speech_multivoice.py (pool engine, without -Clone)  [variant 2]
+#   subtitle-anime.ps1                -> calls srt_to_speech.py            (one voice for all lines)       [variant 1]
 #
-# Single-voice vs multi-voice / unique-voices
-# -------------------------------------------
-#   * Single voice (subtitle-anime.ps1 / srt_to_speech.py): EVERY subtitle line
-#     is spoken by ONE XTTS speaker ("Damien Black" by default). No analysis of
-#     the original audio. Fastest, simplest, no extra dependencies.
-#   * Unique voices (subtitle-anime-unique-voices.ps1 / srt_to_speech_multivoice.py):
-#     fingerprints the ORIGINAL (Japanese) speech under each cue, matches it to a
-#     tracked character, and gives each character their own consistent voice for
-#     the whole series. Each new character's GENDER + AGE is read from a
-#     pretrained speech age+gender model over its original audio (audeering
-#     wav2vec2), which picks a bucket - child / adult / elderly x male / female -
-#     and a distinct voice from that pool; median pitch is only a fallback. Needs
-#     a reference-audio track, a persistent profile JSON, resemblyzer, and
-#     mkvmerge. The age+gender model needs no extra pip package (runs on the
-#     transformers+torch stack) but downloads ~1GB of weights on first use.
+# The three engines
+# -----------------
+#   * CLONED (variant 3 - subtitle-anime-dub-show.ps1 / profile_show.py +
+#     srt_to_speech_cloned.py): Phase A profiles the whole show - Demucs isolates
+#     dialogue, ECAPA embeddings diarize + cluster speakers across ALL episodes,
+#     and each speaker gets gender/age + reference clips (anime-dub-profile.json).
+#     Phase B voices each character by CLONING their own reference clips with XTTS
+#     (matching cues by time-overlap or embedding), so the English inherits the
+#     source timbre. Falls back to a pool voice for weak matches. All local, no
+#     signups; needs demucs + speechbrain + mkvmerge (weights download once).
+#   * POOL (variant 2 - subtitle-anime-unique-voices.ps1 / srt_to_speech_multivoice.py):
+#     fingerprints each cue's ORIGINAL speech, tracks the character across
+#     episodes, and assigns a distinct XTTS pool voice by GENDER + AGE (audeering
+#     age+gender model; median pitch is only a fallback). Needs resemblyzer +
+#     mkvmerge; the age+gender model runs on the transformers+torch stack.
+#   * SINGLE (variant 1 - subtitle-anime.ps1 / srt_to_speech.py): EVERY line is
+#     one XTTS speaker ("Damien Black" by default). No original-audio analysis.
+#     Fastest, simplest, no extra dependencies.
 #
 #
 # -----------------------------------------------------------------------------
@@ -183,9 +203,9 @@ pwsh ./subtitle-anime-unique-voices.ps1 @DubArgs -All
 #
 # Examples:
 #   # Test on the first episode, then confirm before doing the rest:
-#   pwsh ./subtitle-anime.ps1 -Folder "\\10.0.23.105\media\TV\15-18 Animated\Mobile Suit Gundam ZZ"
+#   pwsh ./subtitle-anime.ps1 -Folder "\\10.0.23.105\media\tv\15-18 Animated\Mobile Suit Gundam ZZ"
 #   # Whole folder, local scratch on a fast disk, keep rollback copies:
-#   pwsh ./subtitle-anime.ps1 -Folder "\\10.0.23.105\media\TV\...\MyShow" `
+#   pwsh ./subtitle-anime.ps1 -Folder "\\10.0.23.105\media\tv\15-18 Animated\Mobile Suit Gundam ZZ" `
 #        -All -Scratch "G:\Transcode" -BackupOriginal `
 #        -Python "G:\Transcode\.venv-dub\Scripts\python.exe"
 #
@@ -282,9 +302,9 @@ pwsh ./subtitle-anime-unique-voices.ps1 @DubArgs -All
 #
 # Examples:
 #   # Whole show, defaults, in-place; profile auto-created beside the episodes:
-#   pwsh ./subtitle-anime-unique-voices.ps1 -Folder "\\10.0.23.105\media\TV\...\MyShow" -All
+#   pwsh ./subtitle-anime-unique-voices.ps1 -Folder "\\10.0.23.105\media\tv\15-18 Animated\Mobile Suit Gundam ZZ" -All
 #   # Tune matching + child handling for a show, with an explicit venv python:
-#   pwsh ./subtitle-anime-unique-voices.ps1 -Folder "\\10.0.23.105\media\TV\...\MyShow" `
+#   pwsh ./subtitle-anime-unique-voices.ps1 -Folder "\\10.0.23.105\media\tv\15-18 Animated\Mobile Suit Gundam ZZ" `
 #        -All -MatchThreshold 0.78 -ChildSplit 310 -ChildPitchShift 3 `
 #        -Python "G:\Transcode\.venv-dub\Scripts\python.exe"
 #
@@ -410,8 +430,89 @@ pwsh ./subtitle-anime-unique-voices.ps1 @DubArgs -All
 # Examples:
 #   # Track characters across a show (profile persists between episode runs):
 #   python srt_to_speech_multivoice.py --srt ep01.srt --out ep01.dub.wav `
-#       --ref-audio ep01.ref.wav --profile "\\10.0.23.105\...\MyShow\anime-dub-voices.json" `
+#       --ref-audio ep01.ref.wav --profile "\\10.0.23.105\media\tv\15-18 Animated\Mobile Suit Gundam ZZ\anime-dub-voices.json" `
 #       --duration 1440 --verbose
 #   # Stateless per-cue voices (no cross-episode identity), custom female pool:
 #   python srt_to_speech_multivoice.py --srt ep01.srt --out ep01.dub.wav `
 #       --ref-audio ep01.ref.wav --voices-adult-female "Sofia Hellen;Ana Florence"
+
+
+# -----------------------------------------------------------------------------
+# 5) subtitle-anime-dub-show.ps1  (RECOMMENDED end-to-end orchestrator)
+# -----------------------------------------------------------------------------
+# Purpose: one command for a whole show - runs Phase A (subtitle-anime-profile.ps1)
+#   then Phase B (subtitle-anime-unique-voices.ps1 -Clone -Redub -All). This is the
+#   standard entry point for a new series. Fully local, no signups.
+# Requires: ffmpeg/ffprobe, mkvmerge, and the venv with demucs + speechbrain.
+# Invocation:
+#   pwsh ./subtitle-anime-dub-show.ps1 -Folder <path> [options]
+# Parameters (name  type  default  meaning):
+#   -Folder          string  (required)  Show folder.
+#   -Scratch         string  %TEMP%      Local fast disk for extraction/stems.
+#   -Python          string  "python"    Interpreter (auto .\.venv if present).
+#   -Mkvmerge        string  "mkvmerge"  mkvmerge binary (passed to Phase B).
+#   -Diarizer        string  "ecapa"     Phase A backend (ecapa=no signup).
+#   -SkipProfile     switch  off         Reuse existing anime-dub-profile.json.
+#   -FreshStems      switch  off         Force fresh Demucs separation in Phase A.
+#   -BackupOriginal  switch  off         Keep <name>.pre-dub.<ext> before replacing.
+#   -UseDubbedFolder switch  off         Write to <Folder>\dubbed\ instead of in place.
+#   -NoFit           switch  off         Disable cue duration-fit (on by default here).
+#   -ProfileEpisodes int     0           Cap Phase A to first N episodes (0 = all).
+# Example:
+#   pwsh ./subtitle-anime-dub-show.ps1 `
+#       -Folder "\\10.0.23.105\media\tv\15-18 Animated\Mobile Suit Gundam ZZ" `
+#       -Scratch "G:\Transcode" -Python "G:\Transcode\.venv-dub\Scripts\python.exe"
+#
+#
+# -----------------------------------------------------------------------------
+# 6) subtitle-anime-profile.ps1 / profile_show.py  (Phase A: build the profile)
+# -----------------------------------------------------------------------------
+# Purpose: profile a show ONCE from the original audio. Extracts each episode's
+#   audio, then profile_show.py: Demucs vocal isolation -> diarization -> GLOBAL
+#   speaker clustering across all episodes -> per-speaker gender/age + top-K
+#   reference clips + a fallback pool voice. Writes:
+#     <Folder>\anime-dub-profile.json   speakers (+ centroid, refs, per-ep turns)
+#     <Folder>\anime-dub-profile.qc.txt review report (cast, buckets, ref counts)
+#     <Folder>\anime-dub-clips\*.wav    reference clips Phase B clones from
+# Requires: ffmpeg/ffprobe; venv with demucs; a diarizer backend - ecapa
+#   (speechbrain, no signup) or resemblyzer (installed, cruder) or pyannote
+#   (gated, needs a HF account - avoid if you don't want signups).
+# Key ps1 parameters:
+#   -Folder          (required)   Show folder.
+#   -Diarizer        "auto"       auto|ecapa|resemblyzer|pyannote (prefer ecapa).
+#   -MaxEpisodes     0            Profile only first N (0 = all; all is best).
+#   -ReuseStems      off          Reuse cached Demucs stems (fast re-tuning).
+#   -FreshStems      off          Clear the cached stems first.
+#   -MaxSpeakers     40           Keep at most N speakers (by speech time).
+#   -ClusterThreshold / -LocalThreshold   cosine-DISTANCE knobs (smaller = more
+#                                 distinct). Leave unset for per-backend defaults;
+#                                 lower if the QC report over-merges, raise if it
+#                                 over-splits. Stems cache in
+#                                 <Scratch>\dubprofile-stems_<show> for -ReuseStems.
+# Example (whole show, no signup):
+#   pwsh ./subtitle-anime-profile.ps1 `
+#       -Folder "\\10.0.23.105\media\tv\15-18 Animated\Mobile Suit Gundam ZZ" `
+#       -Scratch "G:\Transcode" -Python "G:\Transcode\.venv-dub\Scripts\python.exe" `
+#       -Diarizer ecapa
+#
+#
+# -----------------------------------------------------------------------------
+# 7) srt_to_speech_cloned.py  (Phase B TTS helper - called with -Clone)
+# -----------------------------------------------------------------------------
+# Purpose: render the timed English dub by CLONING each character's own voice
+#   from the Phase A profile. Matches each cue to a profiled speaker by
+#   time-overlap (if the episode has stored turns) or by embedding its
+#   Demucs-cleaned audio vs speaker centroids, then clones that speaker's
+#   reference clips with XTTS (conditioning cached per speaker). Weak matches or
+#   speakers without clean clips fall back to a pool voice.
+# Requires: coqui-tts, pydub, srt, torch; profile_show.py's helpers (demucs +
+#   the profile's encoder) for the embedding path on un-profiled episodes.
+# Exit codes: 0 ok; 2 no cues; 3 a dependency is missing; 4 bad profile/ref/backend.
+# Key arguments:
+#   --srt --out --profile --ref-audio   (required)
+#   --episode-name   name used in the profile turns (enables time-overlap match)
+#   --match-min-sim  min cosine similarity for the embedding match (per-backend)
+#   --no-demucs-ref  skip Demucs on the ref before embedding (faster, worse)
+#   --fit / --max-speed   duration-fit overrunning lines
+# Note: v1 is cloning + duration-fit. Pitch/energy prosody transfer and seed-vc
+#   accent polish are planned follow-ups.
