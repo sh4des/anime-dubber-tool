@@ -127,7 +127,8 @@ param(
     # confidently match or speakers without clean reference clips.
     [switch]$Clone,
     # Path to the Phase A profile JSON (default <Folder>\anime-dub-profile.json).
-    [string]$Profile = "",
+    # (Named CloneProfile, not Profile, to avoid PowerShell's automatic $PROFILE.)
+    [string]$CloneProfile = "",
 
     # Speed up dub lines that overrun the next subtitle cue (keeps lip-ish sync).
     [switch]$FitToCues,
@@ -202,9 +203,9 @@ if (-not $ProfilePath) { $ProfilePath = Join-Path $Folder "anime-dub-voices.json
 
 # Phase A cloning profile (only used with -Clone).
 if ($Clone) {
-    if (-not $Profile) { $Profile = Join-Path $Folder "anime-dub-profile.json" }
-    if (-not (Test-Path -LiteralPath $Profile)) {
-        throw "-Clone requires a Phase A profile; not found: $Profile`n  Build it first with subtitle-anime-profile.ps1"
+    if (-not $CloneProfile) { $CloneProfile = Join-Path $Folder "anime-dub-profile.json" }
+    if (-not (Test-Path -LiteralPath $CloneProfile)) {
+        throw "-Clone requires a Phase A profile; not found: $CloneProfile`n  Build it first with subtitle-anime-profile.ps1"
     }
     if (-not (Test-Path -LiteralPath $CLONE_SCRIPT)) { throw "Missing $CLONE_SCRIPT" }
 }
@@ -457,7 +458,37 @@ function Copy-WithProgress {
 
 # Calls the multi-voice Python TTS helper to render the timed English WAV.
 function New-DubTrack {
-    param([string]$Srt, [string]$RefAudio, [double]$Duration, [string]$OutWav)
+    param([string]$Srt, [string]$RefAudio, [double]$Duration, [string]$OutWav,
+          [string]$EpisodeName)
+
+    # --- Phase B: cloned-voice engine ----------------------------------------
+    if ($Clone) {
+        $pyArgs = @(
+            $CLONE_SCRIPT,
+            "--srt", $Srt,
+            "--out", $OutWav,
+            "--profile", $CloneProfile,
+            "--ref-audio", $RefAudio,
+            "--episode-name", $EpisodeName,
+            "--duration", $Duration,
+            "--language", "en",
+            "--child-pitch-shift", $ChildPitchShift,
+            "--elder-pitch-shift", $ElderPitchShift
+        )
+        if ($FitToCues) { $pyArgs += "--fit" }
+        $pyArgs += "--verbose"
+
+        Write-Host "  synthesizing CLONED-voice dub on GPU..."
+        Write-Cmd $PYTHON $pyArgs
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        & $PYTHON @pyArgs
+        $sw.Stop()
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $OutWav)) {
+            throw "cloned TTS generation failed for $Srt"
+        }
+        Write-Verbose ("  TTS finished in {0:n1}s -> {1}" -f $sw.Elapsed.TotalSeconds, $OutWav)
+        return
+    }
 
     $pyArgs = @(
         $TTS_SCRIPT,
@@ -745,7 +776,7 @@ function Invoke-Episode {
 
         Write-Host "  [7/8] generating multi-voice English dub (TTS)"
         $dubWav = Join-Path $work "$base.dub.wav"
-        New-DubTrack -Srt $srt -RefAudio $refWav -Duration $dur -OutWav $dubWav
+        New-DubTrack -Srt $srt -RefAudio $refWav -Duration $dur -OutWav $dubWav -EpisodeName $base
 
         Write-Host "  [8/8] muxing tracks (local)"
         $localOut = Join-Path $work "$base.dubbed.mkv"
@@ -784,8 +815,14 @@ $outputMode = if ($UseDubbedFolder) { "separate folder: $OutputDir" } else { "in
 Write-Host "Output mode: $outputMode$(if ($BackupOriginal -and -not $UseDubbedFolder) { ' + .pre-dub backup' })"
 if ($Redub) { Write-Host "Re-dub mode: ON - rebuilding episodes that already have an AI dub track (old dub stripped, originals kept)." -ForegroundColor Yellow }
 Write-Host "mkvmerge: $MKVMERGE (remux/repair each source before processing)"
+if ($Clone) {
+    Write-Host "Voice engine: CLONED (Phase B) - profile: $CloneProfile" -ForegroundColor Cyan
+    Write-Host "  cues matched by time-overlap (profiled episodes) or embedding; pool-voice fallback for weak matches."
+} else {
+    Write-Host "Voice engine: pool (gender/age match)" -ForegroundColor Cyan
+}
 $profileState = if (Test-Path -LiteralPath $ProfilePath) { "existing" } else { "new" }
-Write-Host "Character profile: $ProfilePath ($profileState, match>=$MatchThreshold)"
+Write-Host "Character profile (pool engine): $ProfilePath ($profileState, match>=$MatchThreshold)"
 if ($DisableAgeGender) {
     Write-Host ("Gender/age: PITCH ONLY (Hz): male<$MaleMax, adultF<$AdultFemaleMax, " +
                 "childM<$ChildSplit, else childF  | child +$ChildPitchShift st")
@@ -798,7 +835,9 @@ Write-Host "NOTE: a character's voice is locked when first minted - delete the p
 $episodes = @(
     Get-ChildItem -LiteralPath $Folder -File |
         Where-Object { $VideoExtensions -contains $_.Extension.ToLower() } |
-        Where-Object { $_.Name -notlike "*.dubbed.mkv" } |
+        # *.dubbed.mkv are normally secondary outputs to skip - but with -Redub
+        # they may BE the episodes you want to rebuild in place, so include them.
+        Where-Object { $Redub -or ($_.Name -notlike "*.dubbed.mkv") } |
         Where-Object { $_.Name -notlike "*.pre-dub.*" } |
         Where-Object { $_.Name -notlike "*.replacing.*" } |
         Where-Object { $_.Name -notlike "*.part" } |
