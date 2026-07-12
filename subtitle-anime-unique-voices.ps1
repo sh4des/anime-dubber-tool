@@ -119,6 +119,16 @@ param(
     # Which ORIGINAL audio stream to analyse (0 = first = usually JP).
     [int]$RefAudioIndex = 0,
 
+    # --- Phase B: cloned voices (match the ORIGINAL voice's timbre) -----------
+    # Use the cloned-voice engine (srt_to_speech_cloned.py) instead of the pool
+    # engine: each character is voiced by CLONING their own Japanese voice, using
+    # the show profile built by subtitle-anime-profile.ps1 (Phase A). Requires
+    # that profile. Falls back to the character's pool voice for cues it can't
+    # confidently match or speakers without clean reference clips.
+    [switch]$Clone,
+    # Path to the Phase A profile JSON (default <Folder>\anime-dub-profile.json).
+    [string]$Profile = "",
+
     # Speed up dub lines that overrun the next subtitle cue (keeps lip-ish sync).
     [switch]$FitToCues,
 
@@ -162,7 +172,8 @@ if (-not $PSBoundParameters.ContainsKey('Mkvmerge')) {
     }
 }
 $MKVMERGE = $Mkvmerge
-$TTS_SCRIPT = Join-Path $PSScriptRoot "srt_to_speech_multivoice.py"
+$TTS_SCRIPT   = Join-Path $PSScriptRoot "srt_to_speech_multivoice.py"
+$CLONE_SCRIPT = Join-Path $PSScriptRoot "srt_to_speech_cloned.py"
 
 # ffmpeg log level: 'info' shows what it's doing without the per-frame firehose.
 $FF_LOGLEVEL = "info"
@@ -179,12 +190,24 @@ $TextSubCodecs   = @("subrip", "srt", "ass", "ssa", "mov_text", "webvtt", "text"
 
 # Written on every AI dub audio track; used to detect completed episodes on re-run.
 $DubTrackTitlePrefix = "English Dub (AI)"
+# Full title stamped on the new audio track (still starts with the prefix so
+# re-run detection + -Redub stripping keep working).
+$DubTrackTitle = if ($Clone) { "English Dub (AI, cloned)" } else { "English Dub (AI, multi-voice)" }
 
 # Where finished files go when -UseDubbedFolder is set.
 $OutputDir = Join-Path $Folder "dubbed"
 
 # Show-level character profile shared by every episode in this folder.
 if (-not $ProfilePath) { $ProfilePath = Join-Path $Folder "anime-dub-voices.json" }
+
+# Phase A cloning profile (only used with -Clone).
+if ($Clone) {
+    if (-not $Profile) { $Profile = Join-Path $Folder "anime-dub-profile.json" }
+    if (-not (Test-Path -LiteralPath $Profile)) {
+        throw "-Clone requires a Phase A profile; not found: $Profile`n  Build it first with subtitle-anime-profile.ps1"
+    }
+    if (-not (Test-Path -LiteralPath $CLONE_SCRIPT)) { throw "Missing $CLONE_SCRIPT" }
+}
 
 
 # --- helpers -----------------------------------------------------------------
@@ -542,7 +565,7 @@ function Merge-DubIntoVideo {
         "-map", "0:t?",
         "-c", "copy",
         "-metadata:s:a:$newIdx", "language=eng",
-        "-metadata:s:a:$newIdx", "title=English Dub (AI, multi-voice)",
+        "-metadata:s:a:$newIdx", "title=$DubTrackTitle",
         "-disposition:a:$newIdx", "default",
         # clean up interleaving/timestamps so no track hitches the video
         "-max_interleave_delta", "0",
