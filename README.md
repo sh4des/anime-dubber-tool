@@ -25,6 +25,10 @@ $V = "G:\Transcode\.venv-dub\Scripts\python.exe"
 
 # run script
 $env:TTS_HOME = "G:\Transcode\tts-cache"
+# The multi-voice script also downloads a ~1GB speech age+gender model
+# (audeering/wav2vec2-large-robust-24-ft-age-gender) on first run - it needs
+# internet once, then caches. Relocate that cache off C: with:
+$env:HF_HOME  = "G:\Transcode\hf-cache"
 
 $Show = "\\10.0.23.105\media\TV\15-18 Animated\Mobile Suit Gundam ZZ"
 $DubArgs = @{
@@ -56,8 +60,12 @@ pwsh ./subtitle-anime.ps1 @DubArgs -All
 # Fingerprints the original Japanese speech under each line, matches it to the
 # show's recurring characters, and gives each character their own consistent
 # voice for the whole series. State lives in <Folder>\anime-dub-voices.json
-# (delete it to reset the cast). New characters are bucketed adult/child x
-# male/female by pitch and assigned a distinct voice from that pool.
+# (delete it to reset the cast). Each new character's GENDER + AGE is read from a
+# pretrained speech age+gender model over its original audio, which picks a
+# bucket (child / adult / elderly x male / female) and a distinct voice from that
+# pool. (Median pitch is only a fallback if the model is off/unavailable.)
+# NOTE: a voice is locked when a character is first minted - delete the JSON to
+# re-cast an existing show with the current classifier.
 pwsh ./subtitle-anime-unique-voices.ps1 @DubArgs -All
 
 # with rollback copies:
@@ -68,6 +76,23 @@ pwsh ./subtitle-anime-unique-voices.ps1 @DubArgs -All
 #        -MatchThreshold 0.78 -ChildSplit 310 -ChildPitchShift 3
 # NOTE: process episodes in order (default sort) on the first pass so characters
 # are discovered consistently; the profile is updated after every episode.
+
+# --- RE-ANALYZE a show you have ALREADY dubbed -------------------------------
+# Episodes dubbed in-place already carry an "English Dub (AI)" track, so a plain
+# re-run skips them; and each character's voice is locked in the profile JSON.
+# To re-analyze from scratch with the current classifier: delete the profile so
+# the cast is re-assigned, then -Redub to reprocess (it strips the previous AI
+# dub track and rebuilds it - lossless, since the original audio is still inside
+# the file and the video is copied, not re-encoded). Process in name order.
+#
+#   # 1) re-cast: drop the character profile (voices are otherwise locked)
+#   Remove-Item -LiteralPath (Join-Path $Show "anime-dub-voices.json") -ErrorAction Ignore
+#   # 2) rebuild every episode with the age+gender voice matching
+#   pwsh ./subtitle-anime-unique-voices.ps1 @DubArgs -All -Redub
+#
+# Omit the Remove-Item to keep the existing cast and only re-render (e.g. after
+# changing -OriginalVolume or -ElderPitchShift). Use -UseDubbedFolder + -Redub to
+# rebuild into <Folder>\dubbed\ instead of replacing in place.
 
 
 # =============================================================================
@@ -90,9 +115,13 @@ pwsh ./subtitle-anime-unique-voices.ps1 @DubArgs -All
 #   * Unique voices (subtitle-anime-unique-voices.ps1 / srt_to_speech_multivoice.py):
 #     fingerprints the ORIGINAL (Japanese) speech under each cue, matches it to a
 #     tracked character, and gives each character their own consistent voice for
-#     the whole series. Needs a reference-audio track, a persistent profile JSON,
-#     resemblyzer, and mkvmerge. Falls back to stateless per-line pitch buckets
-#     (4 voices, no cross-episode identity) if resemblyzer is missing.
+#     the whole series. Each new character's GENDER + AGE is read from a
+#     pretrained speech age+gender model over its original audio (audeering
+#     wav2vec2), which picks a bucket - child / adult / elderly x male / female -
+#     and a distinct voice from that pool; median pitch is only a fallback. Needs
+#     a reference-audio track, a persistent profile JSON, resemblyzer, and
+#     mkvmerge. The age+gender model needs no extra pip package (runs on the
+#     transformers+torch stack) but downloads ~1GB of weights on first use.
 #
 #
 # -----------------------------------------------------------------------------
@@ -165,6 +194,13 @@ pwsh ./subtitle-anime-unique-voices.ps1 @DubArgs -All
 #                                             replacing in place.
 #   -BackupOriginal    switch    off          Copy original to <name>.pre-dub.<ext>
 #                                             once before an in-place replace.
+#   -Redub             switch    off          Re-process episodes that ALREADY
+#                                             have an AI dub track: strip the old
+#                                             AI track and rebuild it (lossless -
+#                                             the original audio stays in the file).
+#                                             Also delete the profile JSON first to
+#                                             RE-CAST voices, else the locked-in
+#                                             voices are simply re-rendered.
 #   -OriginalVolume    double    0.6          Original-audio volume under the dub.
 #   -ProfilePath       string    <Folder>\anime-dub-voices.json
 #                                             Show-level character profile JSON;
@@ -183,6 +219,12 @@ pwsh ./subtitle-anime-unique-voices.ps1 @DubArgs -All
 #                                             Alison Dietlinde, Sofia Hellen,
 #                                             Ana Florence, Gracie Wise,
 #                                             Daisy Studious, Brenda Stern.
+#   -VoicesElderlyMale   string[] @()         Override elderly-male pool. Built-in:
+#                                             Baldur Sanjin, Marcos Rudaski,
+#                                             Damien Black.
+#   -VoicesElderlyFemale string[] @()         Override elderly-female pool. Built-in:
+#                                             Brenda Stern, Daisy Studious,
+#                                             Ana Florence.
 #   -VoicesChildMale   string[]  @()          Override child-male pool. Built-in:
 #                                             Andrew Chipper, Craig Gutsy.
 #   -VoicesChildFemale string[]  @()          Override child-female pool. Built-in:
@@ -190,6 +232,15 @@ pwsh ./subtitle-anime-unique-voices.ps1 @DubArgs -All
 #   -VoiceDefault      string    ""           Voice for lines with no clear speaker
 #                                             (music/SFX/overlap). Default = first
 #                                             adult-male pool voice.
+#   --- gender/age classification (primary) ---
+#   -DisableAgeGender  switch    off          Turn the age+gender model OFF and use
+#                                             the pitch fallback below for gender/age.
+#   -ElderAge          double    58           Predicted age (yrs) at/above which a
+#                                             new character is bucketed elderly.
+#   -ElderPitchShift   double    1.5          Semitones to LOWER elderly clips to
+#                                             age them (0 = disable).
+#   -AgeGenderModel    string    ""           Override the HF age+gender model id.
+#   --- pitch fallback (only when the model is off/unavailable) ---
 #   -MaleMax           double    155          Pitch (Hz) below which a NEW character
 #                                             is bucketed adult male.
 #   -AdultFemaleMax    double    250          Below this (and >=MaleMax) -> adult
@@ -260,15 +311,22 @@ pwsh ./subtitle-anime-unique-voices.ps1 @DubArgs -All
 # -----------------------------------------------------------------------------
 # Purpose: same job as srt_to_speech.py, but each cue is voiced by the CHARACTER
 #   who speaks it. Pass 1 slices the --ref-audio under each cue, computes a
-#   resemblyzer d-vector + median pitch, and matches it to the nearest known
-#   character (>= --match-threshold) or mints a new one; new characters are put in
-#   an adult/child x male/female pitch bucket and handed a DISTINCT voice from that
-#   bucket's pool. Pass 2 synthesizes each line in its character's voice. With
-#   --profile, character identities persist across episodes (invoke once per
-#   episode, in name order). Without resemblyzer it degrades to stateless per-line
-#   pitch buckets and says so.
+#   resemblyzer d-vector, and matches it to the nearest known character
+#   (>= --match-threshold) or mints a new one. Each new character's GENDER + AGE
+#   is then read from a pretrained speech age+gender model (audeering wav2vec2)
+#   over its aggregated original speech, which places it in a bucket
+#   (child / adult / elderly x male / female) and hands it a DISTINCT voice from
+#   that bucket's pool. Median pitch is only a fallback (--no-age-gender, model
+#   load failure, or too little clean speech). Pass 2 synthesizes each line in its
+#   character's voice, aging children up and elders down by a small pitch shift.
+#   With --profile, character identities persist across episodes (invoke once per
+#   episode, in name order); a voice is locked when a character is first minted,
+#   so delete the profile to re-cast. Without resemblyzer it degrades to stateless
+#   per-cue classification and says so.
 # Requires: everything srt_to_speech.py needs, plus resemblyzer (and torchaudio,
-#   used for pitch detection). Env vars: same as srt_to_speech.py.
+#   used for the pitch fallback). The age+gender model needs no extra pip package
+#   (runs on transformers+torch) but downloads ~1GB of weights on first use.
+#   Env vars: same as srt_to_speech.py, plus HF_HOME to relocate the model cache.
 # Config file: --profile JSON stores each character's id, bucket, voice, averaged
 #   voice centroid, line count and pitch; rewritten after every run.
 # Exit codes: 0 ok; 2 no subtitle cues; 3 a Python dependency is missing;
@@ -290,12 +348,23 @@ pwsh ./subtitle-anime-unique-voices.ps1 @DubArgs -All
 #   --voices-adult-male    str    None         ';'-separated XTTS speaker names to
 #                                              override the adult-male pool.
 #   --voices-adult-female  str    None         Override the adult-female pool.
+#   --voices-elderly-male   str   None         Override the elderly-male pool.
+#   --voices-elderly-female str   None         Override the elderly-female pool.
 #   --voices-child-male    str    None         Override the child-male pool.
 #   --voices-child-female  str    None         Override the child-female pool.
 #   --voice-default        str    None         Voice for cues with no clear speaker
 #                                              (default: first adult-male voice).
 #   --match-threshold      float  0.75         Cosine similarity to treat a cue as
 #                                              an existing character.
+#   --- gender/age (primary) ---
+#   --age-gender-model     str    audeering/wav2vec2-large-robust-24-ft-age-gender
+#                                              HF id of the speech age+gender model.
+#   --no-age-gender        flag   off          Disable the model; pitch buckets only.
+#   --age-gender-device    str    None         cuda|cpu for the age+gender model.
+#   --elder-age            float  58.0         Age (yrs) >= this -> elderly bucket.
+#   --elder-pitch-shift    float  1.5          Semitones to LOWER elderly clips
+#                                              (0 = disable).
+#   --- pitch fallback (only when the model is off/unavailable) ---
 #   --male-max             float  155.0        Pitch (Hz) upper bound for adult male.
 #   --adult-female-max     float  250.0        Upper bound for adult female.
 #   --child-split          float  300.0        Below -> child male; above -> child
@@ -306,15 +375,18 @@ pwsh ./subtitle-anime-unique-voices.ps1 @DubArgs -All
 #                                              (auto-detected when omitted).
 #   --fit                  flag   off           Time-compress overrunning lines.
 #   --max-speed            float  1.6          Cap for --fit speed-up factor.
-#   --verbose              flag   off          Per-line + per-character logging.
+#   --verbose              flag   off          Per-line + per-character logging
+#                                              (shows each character's gender/age).
 #
 # Built-in voice pools (used when a --voices-* override is not given):
-#   adult_male:   Damien Black, Viktor Eka, Baldur Sanjin, Craig Gutsy,
-#                 Aaron Dreschner, Marcos Rudaski
-#   adult_female: Alison Dietlinde, Sofia Hellen, Ana Florence, Gracie Wise,
-#                 Daisy Studious, Brenda Stern
-#   child_male:   Andrew Chipper, Craig Gutsy
-#   child_female: Tammie Ema, Gracie Wise
+#   adult_male:     Damien Black, Viktor Eka, Baldur Sanjin, Craig Gutsy,
+#                   Aaron Dreschner, Marcos Rudaski
+#   adult_female:   Alison Dietlinde, Sofia Hellen, Ana Florence, Gracie Wise,
+#                   Daisy Studious, Brenda Stern
+#   elderly_male:   Baldur Sanjin, Marcos Rudaski, Damien Black
+#   elderly_female: Brenda Stern, Daisy Studious, Ana Florence
+#   child_male:     Andrew Chipper, Craig Gutsy
+#   child_female:   Tammie Ema, Gracie Wise
 #
 # Examples:
 #   # Track characters across a show (profile persists between episode runs):

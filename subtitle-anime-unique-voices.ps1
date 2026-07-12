@@ -11,11 +11,16 @@
 # The target folder is one show, so a persistent character profile is kept at
 # -ProfilePath (defaults to <Folder>\anime-dub-voices.json). For each cue the
 # ORIGINAL (Japanese) audio under it is fingerprinted (resemblyzer d-vector) and
-# matched to the nearest known character; unknown voices become new characters,
-# each assigned a pitch bucket (adult/child x male/female) and a DISTINCT voice
-# from that bucket's pool. See srt_to_speech_multivoice.py for the full method
-# and its (honest) limitations. Without resemblyzer installed it degrades to
-# stateless per-line pitch buckets and says so.
+# matched to the nearest known character; unknown voices become new characters.
+# Each new character's GENDER + AGE is then read from a pretrained speech
+# age+gender model over its original audio, which picks a bucket (child / adult /
+# elderly x male / female) and a DISTINCT voice from that bucket's pool. See
+# srt_to_speech_multivoice.py for the full method and its (honest) limitations.
+# Median pitch is only a fallback (model off/unavailable). Without resemblyzer
+# installed it degrades to stateless per-cue classification and says so.
+#
+# A character's voice is LOCKED when first minted, so to re-cast an existing show
+# with the current classifier, DELETE the profile JSON and re-run.
 #
 # -----------------------------------------------------------------------------
 # Requires (on PATH or set the *_EXE vars below):
@@ -32,6 +37,10 @@
 #   # tune matching / thresholds for a show:
 #   pwsh ./subtitle-anime-unique-voices.ps1 -Folder "..." `
 #        -MatchThreshold 0.78 -ChildSplit 310 -ChildPitchShift 3
+#   # RE-ANALYZE a show already dubbed: delete the profile to re-cast, then -Redub
+#   # (strips the old AI dub track and rebuilds it losslessly, in name order):
+#   Remove-Item -LiteralPath "<Folder>\anime-dub-voices.json" -ErrorAction Ignore
+#   pwsh ./subtitle-anime-unique-voices.ps1 -Folder "<Folder>" -All -Redub
 #
 # Same network-share behaviour as the basic script: source is copied to
 # -Scratch (local disk), all work happens locally, then the finished file
@@ -56,6 +65,15 @@ param(
     # <name>.pre-dub.<ext> once (handy if you want a rollback copy on the share).
     [switch]$BackupOriginal,
 
+    # Re-process episodes that ALREADY have an AI dub track: strip the previous
+    # AI dub track and rebuild it. The original audio is still inside the dubbed
+    # file, so this is lossless (video is copied, not re-encoded). Use after
+    # changing voice settings, or to re-cast a show with an improved classifier.
+    # To actually RE-CAST (not just re-render the same voices), ALSO delete the
+    # profile JSON first (see -ProfilePath) so characters are re-assigned instead
+    # of reusing their locked-in voices.
+    [switch]$Redub,
+
     # Volume the original audio is mixed down to under the English dub (0.6 = 60%).
     [double]$OriginalVolume = 0.6,
 
@@ -71,15 +89,27 @@ param(
     # New characters get the first unused pool voice for their bucket, then the
     # pool cycles. Empty = use the script's built-in pools (see the .py header).
     # "Damien Black" leads the adult-male pool, matching the basic script.
-    [string[]]$VoicesAdultMale   = @(),
-    [string[]]$VoicesAdultFemale = @(),
-    [string[]]$VoicesChildMale   = @(),
-    [string[]]$VoicesChildFemale = @(),
+    [string[]]$VoicesAdultMale     = @(),
+    [string[]]$VoicesAdultFemale   = @(),
+    [string[]]$VoicesElderlyMale   = @(),
+    [string[]]$VoicesElderlyFemale = @(),
+    [string[]]$VoicesChildMale     = @(),
+    [string[]]$VoicesChildFemale   = @(),
     # Voice for lines with no clear speaker (music/SFX/overlap); default = first
     # adult-male pool voice.
     [string]$VoiceDefault     = "",
 
-    # --- pitch buckets (Hz) - decide a NEW character's gender/age + voice pool -
+    # --- gender/age classification (primary) ----------------------------------
+    # A NEW character's gender + age is read from a pretrained speech age+gender
+    # model run over its ORIGINAL (Japanese) audio; that picks the voice pool.
+    # No extra pip package (runs on transformers+torch); ~1GB weights download to
+    # the HuggingFace cache on first use (set $env:HF_HOME to relocate it).
+    [switch]$DisableAgeGender,             # use pitch buckets only (below)
+    [double]$ElderAge        = 58,         # predicted age (yrs) >= this -> elderly
+    [double]$ElderPitchShift = 1.5,        # semitones to LOWER elderly clips (0=off)
+    [string]$AgeGenderModel  = "",         # override the HF model id (advanced)
+
+    # --- pitch fallback (Hz) - only when the age+gender model is off/unavailable
     [double]$MaleMax        = 155,   # below this  -> adult male
     [double]$AdultFemaleMax = 250,   # below this  -> adult female
     [double]$ChildSplit     = 300,   # below this  -> child male, else child female
@@ -415,18 +445,24 @@ function New-DubTrack {
         "--duration", $Duration,
         "--language", "en",
         "--match-threshold",  $MatchThreshold,
+        "--elder-age",        $ElderAge,
+        "--elder-pitch-shift", $ElderPitchShift,
         "--male-max",         $MaleMax,
         "--adult-female-max", $AdultFemaleMax,
         "--child-split",      $ChildSplit,
         "--child-pitch-shift", $ChildPitchShift
     )
     # Voice pools are ';'-separated; only send overrides, else the .py defaults win.
-    if ($VoicesAdultMale)   { $pyArgs += @("--voices-adult-male",   ($VoicesAdultMale   -join ';')) }
-    if ($VoicesAdultFemale) { $pyArgs += @("--voices-adult-female", ($VoicesAdultFemale -join ';')) }
-    if ($VoicesChildMale)   { $pyArgs += @("--voices-child-male",   ($VoicesChildMale   -join ';')) }
-    if ($VoicesChildFemale) { $pyArgs += @("--voices-child-female", ($VoicesChildFemale -join ';')) }
-    if ($VoiceDefault) { $pyArgs += @("--voice-default", $VoiceDefault) }
-    if ($FitToCues)    { $pyArgs += "--fit" }
+    if ($VoicesAdultMale)     { $pyArgs += @("--voices-adult-male",     ($VoicesAdultMale     -join ';')) }
+    if ($VoicesAdultFemale)   { $pyArgs += @("--voices-adult-female",   ($VoicesAdultFemale   -join ';')) }
+    if ($VoicesElderlyMale)   { $pyArgs += @("--voices-elderly-male",   ($VoicesElderlyMale   -join ';')) }
+    if ($VoicesElderlyFemale) { $pyArgs += @("--voices-elderly-female", ($VoicesElderlyFemale -join ';')) }
+    if ($VoicesChildMale)     { $pyArgs += @("--voices-child-male",     ($VoicesChildMale     -join ';')) }
+    if ($VoicesChildFemale)   { $pyArgs += @("--voices-child-female",   ($VoicesChildFemale   -join ';')) }
+    if ($VoiceDefault)     { $pyArgs += @("--voice-default", $VoiceDefault) }
+    if ($DisableAgeGender) { $pyArgs += "--no-age-gender" }
+    if ($AgeGenderModel)   { $pyArgs += @("--age-gender-model", $AgeGenderModel) }
+    if ($FitToCues)        { $pyArgs += "--fit" }
     $pyArgs += "--verbose"
 
     Write-Host "  synthesizing multi-voice dub on GPU..."
@@ -448,12 +484,26 @@ function Merge-DubIntoVideo {
     param([string]$Video, [string]$DubWav, $Probe, [string]$OutVideo, [string]$WorkDir)
 
     $audioStreams = @($Probe.streams | Where-Object { $_.codec_type -eq "audio" })
-    $origAudioCount = $audioStreams.Count
+    # Audio-relative indices to KEEP from the source = every audio track that is
+    # NOT a previous AI dub track. On a fresh run that is all of them; on -Redub
+    # it drops the stale AI dub(s) so English isn't stacked (originals stay put).
+    $keepAudioRel = @()
+    for ($i = 0; $i -lt $audioStreams.Count; $i++) {
+        $t = $audioStreams[$i].tags.title
+        if (-not ($t -and $t.StartsWith($DubTrackTitlePrefix))) { $keepAudioRel += $i }
+    }
+    if ($keepAudioRel.Count -lt $audioStreams.Count) {
+        Write-Verbose ("  dropping {0} previous AI dub track(s); keeping {1} original audio track(s)" -f `
+            ($audioStreams.Count - $keepAudioRel.Count), $keepAudioRel.Count)
+    }
+    $origAudioCount = $keepAudioRel.Count
     $newIdx = $origAudioCount   # output audio index of the mixed English track
+    # Duck the FIRST kept original under the dub (index 0 on a fresh run).
+    $firstOrig = if ($keepAudioRel.Count) { $keepAudioRel[0] } else { 0 }
     $mixedAac = Join-Path $WorkDir "mixed_english.m4a"
 
-    # English track = original(0:a:0) at $OriginalVolume + dub(1:a) at full.
-    $filter = "[0:a:0]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,volume=$OriginalVolume[orig];" +
+    # English track = first original(0:a:$firstOrig) at $OriginalVolume + dub(1:a).
+    $filter = "[0:a:$firstOrig]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,volume=$OriginalVolume[orig];" +
               "[1:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,volume=1.0[dub];" +
               "[orig][dub]amix=inputs=2:duration=first:dropout_transition=0:normalize=0,alimiter=limit=0.95[mix]"
 
@@ -482,8 +532,11 @@ function Merge-DubIntoVideo {
         "-y", "-v", $FF_LOGLEVEL, "-stats",
         "-i", $Video,
         "-i", $mixedAac,
-        "-map", "0:v",
-        "-map", "0:a",
+        "-map", "0:v"
+    )
+    # Keep only the original (non-AI-dub) audio tracks, in order, then the new one.
+    foreach ($rel in $keepAudioRel) { $p2 += @("-map", "0:a:$rel") }
+    $p2 += @(
         "-map", "1:a",
         "-map", "0:s?",
         "-map", "0:t?",
@@ -585,20 +638,25 @@ function Invoke-Episode {
     Write-Host "  [1/8] probing source"
     $probe = Invoke-FFProbeJson -Path $Video
     if (Test-HasAiDubTrack $probe) {
-        Write-Host "  already has AI dub track, skipping."
-        return $true
-    }
-    if ($UseDubbedFolder) {
-        $legacyOut = Join-Path $OutputDir "$base.dubbed.mkv"
-        if (Test-Path -LiteralPath $legacyOut) {
-            Write-Host "  already done, skipping (output in $OutputDir)."
+        if (-not $Redub) {
+            Write-Host "  already has AI dub track, skipping (use -Redub to rebuild it)."
             return $true
         }
+        Write-Host "  -Redub: stripping the existing AI dub track and rebuilding." -ForegroundColor Yellow
     }
-    $legacyBeside = Join-Path ([IO.Path]::GetDirectoryName($Video)) "$base.dubbed.mkv"
-    if (Test-Path -LiteralPath $legacyBeside) {
-        Write-Host "  legacy dubbed copy beside source, skipping ($([IO.Path]::GetFileName($legacyBeside)))."
-        return $true
+    if (-not $Redub) {
+        if ($UseDubbedFolder) {
+            $legacyOut = Join-Path $OutputDir "$base.dubbed.mkv"
+            if (Test-Path -LiteralPath $legacyOut) {
+                Write-Host "  already done, skipping (output in $OutputDir)."
+                return $true
+            }
+        }
+        $legacyBeside = Join-Path ([IO.Path]::GetDirectoryName($Video)) "$base.dubbed.mkv"
+        if (Test-Path -LiteralPath $legacyBeside) {
+            Write-Host "  legacy dubbed copy beside source, skipping ($([IO.Path]::GetFileName($legacyBeside)))."
+            return $true
+        }
     }
 
     $dur = Get-VideoDuration $probe
@@ -701,11 +759,18 @@ Write-Host "Local scratch: $Scratch  (drive $scratchRoot, $freeGB GB free)"
 Write-Host "Python: $PYTHON"
 $outputMode = if ($UseDubbedFolder) { "separate folder: $OutputDir" } else { "in-place (replace source)" }
 Write-Host "Output mode: $outputMode$(if ($BackupOriginal -and -not $UseDubbedFolder) { ' + .pre-dub backup' })"
+if ($Redub) { Write-Host "Re-dub mode: ON - rebuilding episodes that already have an AI dub track (old dub stripped, originals kept)." -ForegroundColor Yellow }
 Write-Host "mkvmerge: $MKVMERGE (remux/repair each source before processing)"
 $profileState = if (Test-Path -LiteralPath $ProfilePath) { "existing" } else { "new" }
 Write-Host "Character profile: $ProfilePath ($profileState, match>=$MatchThreshold)"
-Write-Host ("Pitch buckets for new characters (Hz): male<$MaleMax, adultF<$AdultFemaleMax, " +
-            "childM<$ChildSplit, else childF  | child +$ChildPitchShift semitones")
+if ($DisableAgeGender) {
+    Write-Host ("Gender/age: PITCH ONLY (Hz): male<$MaleMax, adultF<$AdultFemaleMax, " +
+                "childM<$ChildSplit, else childF  | child +$ChildPitchShift st")
+} else {
+    Write-Host ("Gender/age: age+gender model (elderly>= ${ElderAge}y, elder -$ElderPitchShift st, " +
+                "child +$ChildPitchShift st); pitch is fallback")
+}
+Write-Host "NOTE: a character's voice is locked when first minted - delete the profile JSON to re-cast with the current classifier."
 
 $episodes = @(
     Get-ChildItem -LiteralPath $Folder -File |
