@@ -56,6 +56,25 @@ pwsh ./subtitle-anime.ps1 @DubArgs -All
 # keep originals untouched; write dubbed copies to <Folder>\dubbed\ instead:
 # pwsh ./subtitle-anime.ps1 @DubArgs -All -UseDubbedFolder
 
+# --- variant 3 (RECOMMENDED): cloned voices, whole show, one command ---------
+# Clone each character's ACTUAL (Japanese) voice instead of picking one from a
+# pool. Two phases, both local / no signups (Demucs + SpeechBrain ECAPA + XTTS
+# download weights anonymously; no audio leaves the machine):
+#   PHASE A  profile the whole show  -> anime-dub-profile.json + reference clips
+#   PHASE B  dub every episode by cloning each character from that profile
+# The orchestrator runs both. Safe to re-run (profiling overwrites; dubbing is
+# -Redub + resume-safe: it skips episodes already rebuilt with the cloned engine,
+# so an interrupted run just continues). Needs: pip install demucs speechbrain
+#   pwsh ./subtitle-anime-dub-show.ps1 @DubArgs
+#   pwsh ./subtitle-anime-dub-show.ps1 @DubArgs -BackupOriginal   # rollback copies
+#   pwsh ./subtitle-anime-dub-show.ps1 @DubArgs -SkipProfile      # reuse profile
+# Or run the phases yourself:
+#   pwsh ./subtitle-anime-profile.ps1 @DubArgs -Diarizer ecapa            # Phase A
+#   pwsh ./subtitle-anime-unique-voices.ps1 @DubArgs -Clone -Redub -All   # Phase B
+# Profiling the FULL show (no -MaxEpisodes) is best: it discovers the whole cast
+# and lets every episode dub via the fast, accurate time-overlap path.
+
+
 # --- variant 2: unique voice per CHARACTER, tracked across episodes ----------
 # Fingerprints the original Japanese speech under each line, matches it to the
 # show's recurring characters, and gives each character their own consistent

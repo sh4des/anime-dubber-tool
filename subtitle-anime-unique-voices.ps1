@@ -250,6 +250,17 @@ function Test-HasAiDubTrack {
     return $false
 }
 
+# True when the file already carries a track with THIS exact engine's title
+# (e.g. "English Dub (AI, cloned)"). Lets -Redub skip episodes this pass already
+# rebuilt, so an interrupted long run resumes instead of redoing finished work.
+function Test-HasDubVariant {
+    param($Probe, [string]$Title)
+    foreach ($s in @($Probe.streams | Where-Object { $_.codec_type -eq "audio" })) {
+        if ($s.tags.title -eq $Title) { return $true }
+    }
+    return $false
+}
+
 # Remove stale transfer files left by an interrupted copy/replace on the share.
 function Clear-StaleTransferArtifacts {
     param([string]$Video)
@@ -694,6 +705,10 @@ function Invoke-Episode {
     if (Test-HasAiDubTrack $probe) {
         if (-not $Redub) {
             Write-Host "  already has AI dub track, skipping (use -Redub to rebuild it)."
+            return $true
+        }
+        if (Test-HasDubVariant $probe $DubTrackTitle) {
+            Write-Host "  already rebuilt with '$DubTrackTitle' this pass, skipping (resume-safe)."
             return $true
         }
         Write-Host "  -Redub: stripping the existing AI dub track and rebuilding." -ForegroundColor Yellow
