@@ -51,7 +51,10 @@ param(
     [string]$Diarizer = "auto",
     [string]$HfToken  = "",
     [switch]$NoDemucs,
-    [double]$ClusterThreshold = 0.70,
+    # Cosine DISTANCE thresholds (smaller = more distinct speakers). Tuned for
+    # resemblyzer's compressed embedding space; too high merges everyone.
+    [double]$ClusterThreshold = 0.30,
+    [double]$LocalThreshold   = 0.25,
 
     [string]$Python = "python"
 )
@@ -71,6 +74,12 @@ $FF_LOGLEVEL = "info"
 if (-not $Out)     { $Out     = Join-Path $Folder "anime-dub-profile.json" }
 if (-not $ClipDir) { $ClipDir = Join-Path $Folder "anime-dub-clips" }
 if (-not $HfToken) { $HfToken = $env:HF_TOKEN }
+# pyannote (wespeaker) embeddings are more spread than resemblyzer's, so the
+# resemblyzer-tuned 0.30 would over-split. Bump the default when the user didn't
+# set it explicitly and the pyannote backend is selected.
+if (-not $PSBoundParameters.ContainsKey('ClusterThreshold') -and $Diarizer -eq 'pyannote') {
+    $ClusterThreshold = 0.50
+}
 
 $VideoExtensions = @(".mkv", ".mp4", ".m4v", ".avi", ".ts")
 
@@ -108,7 +117,7 @@ if ($MaxEpisodes -gt 0 -and $episodes.Count -gt $MaxEpisodes) {
 Write-Host "Profiling $($episodes.Count) episode(s) from $Folder"
 Write-Host "Profile out: $Out"
 Write-Host "Clip dir:    $ClipDir"
-Write-Host "Diarizer:    $Diarizer  (demucs=$(-not $NoDemucs), cluster>=$ClusterThreshold)"
+Write-Host "Diarizer:    $Diarizer  (demucs=$(-not $NoDemucs), cluster<=$ClusterThreshold, local<=$LocalThreshold)"
 if ($Diarizer -ne 'resemblyzer' -and -not $HfToken) {
     Write-Warning "No -HfToken/HF_TOKEN set; pyannote (gated) will fall back to resemblyzer."
 }
@@ -158,6 +167,7 @@ try {
         "--scratch", (Join-Path $work "stems"),
         "--diarizer", $Diarizer,
         "--cluster-threshold", $ClusterThreshold,
+        "--local-threshold", $LocalThreshold,
         "--verbose"
     )
     if ($NoDemucs) { $pyArgs += "--no-demucs" }

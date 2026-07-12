@@ -371,10 +371,15 @@ def main() -> int:
     ap.add_argument("--no-demucs", action="store_true",
                     help="skip Demucs source separation")
 
-    ap.add_argument("--cluster-threshold", type=float, default=0.70,
+    # NOTE: these are cosine DISTANCES (0=identical, ~1=unrelated). resemblyzer
+    # embeddings are compressed - even different speakers are only ~0.2-0.4 apart
+    # - so these thresholds must be SMALL or everyone merges into one blob. Tuned
+    # for the resemblyzer backend; pyannote (wespeaker) embeddings are more spread
+    # and tolerate larger values.
+    ap.add_argument("--cluster-threshold", type=float, default=0.30,
                     help="cosine distance to merge speakers GLOBALLY (higher = "
-                         "fewer, broader speakers)")
-    ap.add_argument("--local-threshold", type=float, default=0.60,
+                         "fewer, broader speakers; lower = more distinct)")
+    ap.add_argument("--local-threshold", type=float, default=0.25,
                     help="cosine distance for per-episode clustering (resemblyzer "
                          "backend only)")
 
@@ -405,6 +410,25 @@ def main() -> int:
         return 3
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[profile] device={device}")
+
+    # Fail loudly on missing requested backends, so we don't silently degrade to
+    # un-separated audio / a weaker diarizer and waste a full run.
+    import importlib.util
+    def _have(m):
+        return importlib.util.find_spec(m) is not None
+    if not args.no_demucs and not _have("demucs"):
+        print("[profile] FATAL: Demucs requested but 'demucs' is not installed.\n"
+              "         install:  pip install demucs\n"
+              "         or pass --no-demucs to run on un-separated audio (much worse).",
+              file=sys.stderr)
+        return 3
+    if args.diarizer == "pyannote" and not _have("pyannote.audio"):
+        print("[profile] FATAL: --diarizer pyannote but 'pyannote.audio' is not "
+              "installed.\n         install:  pip install pyannote.audio\n"
+              "         then accept terms for pyannote/speaker-diarization-3.1 AND\n"
+              "         pyannote/wespeaker-voxceleb-resnet34-LM on HuggingFace, and\n"
+              "         set HF_TOKEN (or pass --hf-token).", file=sys.stderr)
+        return 3
 
     os.makedirs(args.clip_dir, exist_ok=True)
     scratch = args.scratch or os.path.join(args.clip_dir, "_stems")
