@@ -213,44 +213,40 @@ def demucs_vocals(mono_or_path, out_wav, device, verbose=False):
 #   [{"emb": np[d], "segments": [(a,b), ...], "dur": float_seconds}, ...]
 # with sample indices a,b into the TARGET_SR mono array it was given.
 
-def diarize_resemblyzer(mono16k, sr, encoder, local_threshold, verbose=False):
-    import numpy as np
-    if encoder is None:
-        return []
-    regions = energy_vad(mono16k, sr)
-    win = int(1.5 * sr)
-    hop = int(0.75 * sr)
-    windows = []          # (a, b)
+def _speech_windows(mono, sr, win_s=1.5, hop_s=0.75):
+    """VAD -> sliding windows over speech regions. Returns [(a, b), ...]."""
+    regions = energy_vad(mono, sr)
+    win, hop = int(win_s * sr), int(hop_s * sr)
+    out = []
     for a, b in regions:
         if b - a < int(0.6 * sr):
-            windows.append((a, b))
+            out.append((a, b))
             continue
         t = a
         while t + win <= b:
-            windows.append((t, t + win))
+            out.append((t, t + win))
             t += hop
-        if not windows or windows[-1][1] < b - int(0.3 * sr):
-            windows.append((max(a, b - win), b))
+        if out[-1][1] < b - int(0.3 * sr):
+            out.append((max(a, b - win), b))
+    return out
+
+
+def diarize_windows(mono, sr, embed_one, local_threshold, label="", verbose=False):
+    """Generic window-embed + cluster diarizer. embed_one(seg_np)->vec|None.
+    Returns local speakers: [{"emb", "segments", "dur"}, ...]."""
+    import numpy as np
+    windows = _speech_windows(mono, sr)
     if not windows:
         return []
-
-    from resemblyzer import preprocess_wav
     embs, keep = [], []
     for a, b in windows:
-        seg = mono16k[a:b]
-        try:
-            w = preprocess_wav(seg, source_sr=sr)
-            if w.size < int(0.3 * sr):
-                continue
-            embs.append(encoder.embed_utterance(w))
+        v = embed_one(mono[a:b])
+        if v is not None:
+            embs.append(np.asarray(v, dtype=np.float64).reshape(-1))
             keep.append((a, b))
-        except Exception:
-            continue
     if not embs:
         return []
     labels = agglomerative_cosine(embs, local_threshold)
-
-    # merge windows sharing a label into per-local-speaker segments
     spk = {}
     for (a, b), lab, emb in zip(keep, labels, embs):
         s = spk.setdefault(int(lab), {"emb": [], "segments": []})
@@ -262,8 +258,54 @@ def diarize_resemblyzer(mono16k, sr, encoder, local_threshold, verbose=False):
         dur = sum((b - a) for a, b in segs) / sr
         out.append({"emb": np.mean(s["emb"], axis=0), "segments": segs, "dur": dur})
     if verbose:
-        print(f"[profile]   resemblyzer diarizer: {len(out)} local speaker(s)")
+        print(f"[profile]   {label} diarizer: {len(out)} local speaker(s)")
     return out
+
+
+def make_resemblyzer_embed(encoder, sr):
+    """embed_one closure for the resemblyzer backend (already-installed)."""
+    if encoder is None:
+        return None
+    from resemblyzer import preprocess_wav
+
+    def embed_one(seg):
+        try:
+            w = preprocess_wav(seg, source_sr=sr)
+            if w.size < int(0.3 * sr):
+                return None
+            return encoder.embed_utterance(w)
+        except Exception:
+            return None
+    return embed_one
+
+
+def make_ecapa_embed(device, sr):
+    """embed_one closure for SpeechBrain's ECAPA-TDNN (non-gated, local, more
+    discriminative than resemblyzer). Returns None if speechbrain is missing."""
+    try:
+        import torch
+        from speechbrain.inference.speaker import EncoderClassifier
+    except Exception as e:
+        print(f"[profile] ECAPA unavailable ({e}); install:  pip install speechbrain",
+              file=sys.stderr)
+        return None
+    savedir = os.path.join(os.environ.get("HF_HOME", os.path.expanduser("~/.cache")),
+                           "speechbrain-ecapa")
+    clf = EncoderClassifier.from_hparams(
+        source="speechbrain/spkrec-ecapa-voxceleb",
+        run_opts={"device": device}, savedir=savedir)
+
+    def embed_one(seg):
+        try:
+            if seg.size < int(0.4 * sr):
+                return None
+            t = torch.from_numpy(seg).float().unsqueeze(0).to(device)
+            e = clf.encode_batch(t)          # (1, 1, 192)
+            return e.squeeze().detach().cpu().numpy()
+        except Exception:
+            return None
+    print(f"[profile] ECAPA speaker encoder loaded (device={device})")
+    return embed_one
 
 
 def diarize_pyannote(wav_path, sr, token, device, verbose=False):
@@ -364,24 +406,33 @@ def main() -> int:
     ap.add_argument("--scratch", default=None,
                     help="scratch dir for Demucs stems (default: alongside clips)")
 
-    ap.add_argument("--diarizer", choices=["auto", "pyannote", "resemblyzer"],
-                    default="auto")
+    ap.add_argument("--diarizer",
+                    choices=["auto", "ecapa", "pyannote", "resemblyzer"],
+                    default="auto",
+                    help="ecapa=SpeechBrain (no signup, best local quality); "
+                         "resemblyzer=already installed (crude); pyannote=gated. "
+                         "auto prefers ecapa, then resemblyzer.")
     ap.add_argument("--hf-token", default=None,
                     help="HuggingFace token for the gated pyannote model")
     ap.add_argument("--no-demucs", action="store_true",
                     help="skip Demucs source separation")
+    ap.add_argument("--reuse-stems", action="store_true",
+                    help="reuse Demucs vocal stems already in --scratch instead of "
+                         "re-separating (fast when tuning thresholds)")
+    ap.add_argument("--max-speakers", type=int, default=40,
+                    help="keep at most this many global speakers (by speech time)")
 
     # NOTE: these are cosine DISTANCES (0=identical, ~1=unrelated). resemblyzer
     # embeddings are compressed - even different speakers are only ~0.2-0.4 apart
     # - so these thresholds must be SMALL or everyone merges into one blob. Tuned
     # for the resemblyzer backend; pyannote (wespeaker) embeddings are more spread
     # and tolerate larger values.
-    ap.add_argument("--cluster-threshold", type=float, default=0.30,
+    ap.add_argument("--cluster-threshold", type=float, default=None,
                     help="cosine distance to merge speakers GLOBALLY (higher = "
-                         "fewer, broader speakers; lower = more distinct)")
-    ap.add_argument("--local-threshold", type=float, default=0.25,
-                    help="cosine distance for per-episode clustering (resemblyzer "
-                         "backend only)")
+                         "fewer, broader speakers). Default is per-backend.")
+    ap.add_argument("--local-threshold", type=float, default=None,
+                    help="cosine distance for per-episode window clustering. "
+                         "Default is per-backend.")
 
     ap.add_argument("--top-k-refs", type=int, default=4,
                     help="reference clips saved per speaker")
@@ -430,6 +481,30 @@ def main() -> int:
               "         set HF_TOKEN (or pass --hf-token).", file=sys.stderr)
         return 3
 
+    # Resolve 'auto' to a concrete backend: prefer pyannote (best, gated), then
+    # ecapa (SpeechBrain, no signup), then resemblyzer (installed, crude).
+    backend = args.diarizer
+    if backend == "auto":
+        backend = ("pyannote" if _have("pyannote.audio")
+                   else "ecapa" if _have("speechbrain")
+                   else "resemblyzer")
+        print(f"[profile] diarizer=auto -> {backend}")
+    if backend == "ecapa" and not _have("speechbrain"):
+        print("[profile] FATAL: --diarizer ecapa but 'speechbrain' is not "
+              "installed.\n         install:  pip install speechbrain",
+              file=sys.stderr)
+        return 3
+
+    # Per-backend default thresholds (cosine distance). These differ because each
+    # encoder's embedding space is scaled differently: resemblyzer is compressed,
+    # ecapa/wespeaker are more spread. Overridable via the CLI.
+    if args.cluster_threshold is None:
+        args.cluster_threshold = {"pyannote": 0.50, "ecapa": 0.45}.get(backend, 0.35)
+    if args.local_threshold is None:
+        args.local_threshold = 0.55 if backend == "ecapa" else 0.45
+    print(f"[profile] thresholds: local<={args.local_threshold} "
+          f"global<={args.cluster_threshold}")
+
     os.makedirs(args.clip_dir, exist_ok=True)
     scratch = args.scratch or os.path.join(args.clip_dir, "_stems")
     os.makedirs(scratch, exist_ok=True)
@@ -451,13 +526,21 @@ def main() -> int:
         return 2
     print(f"[profile] {len(episodes)} episode(s) to profile")
 
-    # optional resemblyzer encoder (fallback diarizer / needed if pyannote off)
-    encoder = None
-    if args.diarizer in ("auto", "resemblyzer"):
+    # Build the window-embedding function for the chosen local backend. pyannote
+    # is self-contained (no embed_one needed).
+    embed_one = None
+    if backend == "resemblyzer":
         from srt_to_speech_multivoice import make_encoder
-        encoder = make_encoder(device)
-
-    use_pyannote = args.diarizer in ("auto", "pyannote")
+        enc = make_encoder(device)
+        embed_one = make_resemblyzer_embed(enc, TARGET_SR)
+        if embed_one is None:
+            print("[profile] FATAL: resemblyzer unavailable.", file=sys.stderr)
+            return 3
+    elif backend == "ecapa":
+        embed_one = make_ecapa_embed(device, TARGET_SR)
+        if embed_one is None:
+            return 3
+    print(f"[profile] diarizer backend: {backend}")
 
     # --- stage 1+2: per-episode isolation + diarization -----------------------
     # We keep each episode's TARGET_SR mono array on disk (as the stem wav) so we
@@ -473,10 +556,16 @@ def main() -> int:
                   file=sys.stderr)
             continue
 
-        # dialogue isolation -> a working wav (vocals stem, or the original)
+        # dialogue isolation -> a working wav (vocals stem, or the original).
+        # Reuse a cached stem when tuning so we don't re-run Demucs every time.
         work_wav = os.path.join(scratch, f"{name}.vocals.wav")
-        used = None if args.no_demucs else demucs_vocals(
-            wav_path, work_wav, device, args.verbose)
+        if args.no_demucs:
+            used = None
+        elif args.reuse_stems and os.path.exists(work_wav):
+            print(f"[profile]   reusing cached vocal stem")
+            used = work_wav
+        else:
+            used = demucs_vocals(wav_path, work_wav, device, args.verbose)
         src_wav = used or wav_path
 
         mono = load_audio(src_wav, TARGET_SR)
@@ -486,28 +575,25 @@ def main() -> int:
         ep_idx = len(ep_stub)
         ep_stub.append((name, stem_wav, TARGET_SR))
 
-        locals_ = None
-        if use_pyannote:
+        if backend == "pyannote":
             locals_ = diarize_pyannote(src_wav, TARGET_SR, args.hf_token,
                                        device, args.verbose)
-            if locals_ is None and args.diarizer == "pyannote":
-                print("[profile]   pyannote requested but unavailable; "
-                      "install/authorize it or use --diarizer auto.",
+            if locals_ is None:
+                print("[profile] FATAL: pyannote diarization failed (see above). "
+                      "Fix install/auth, or use --diarizer ecapa|resemblyzer.",
                       file=sys.stderr)
-            elif locals_ is not None:
-                backends_used.add("pyannote")
-        if locals_ is None:
-            locals_ = diarize_resemblyzer(mono, TARGET_SR, encoder,
-                                          args.local_threshold, args.verbose)
+                return 4
+            backends_used.add("pyannote")
+        else:
+            locals_ = diarize_windows(mono, TARGET_SR, embed_one,
+                                      args.local_threshold, label=backend,
+                                      verbose=args.verbose)
             if locals_:
-                backends_used.add("resemblyzer")
+                backends_used.add(backend)
         for ls in locals_:
             ls["episode"] = ep_idx
             local_speakers.append(ls)
-
-        # drop the demucs stem now; keep the mono16k for slicing
-        if used and os.path.exists(work_wav):
-            os.remove(work_wav)
+        # NOTE: vocal stems are kept in --scratch for --reuse-stems on re-tuning.
 
     if not local_speakers:
         print("[profile] no speakers found in any episode.", file=sys.stderr)
@@ -529,8 +615,27 @@ def main() -> int:
         speakers.append({"members": members, "dur": total, "centroid": centroid})
     speakers = [s for s in speakers if s["dur"] >= args.min_speaker_sec]
     speakers.sort(key=lambda s: -s["dur"])
-    print(f"[profile] global speakers kept (>= {args.min_speaker_sec}s): "
-          f"{len(speakers)}")
+
+    # Prune speakers that cannot yield a clean reference clip (no solo segment
+    # >= min-ref-sec) - they can't be cloned, only pollute the cast. Then cap to
+    # the top --max-speakers by speech time (the over-split tail is noise).
+    def longest_solo_sec(s):
+        best = 0.0
+        for m in s["members"]:
+            sr = ep_stub[m["episode"]][2]
+            for a, b in m["segments"]:
+                best = max(best, (b - a) / sr)
+        return best
+    before = len(speakers)
+    speakers = [s for s in speakers if longest_solo_sec(s) >= args.min_ref_sec]
+    dropped_noref = before - len(speakers)
+    if len(speakers) > args.max_speakers:
+        print(f"[profile] capping {len(speakers)} -> {args.max_speakers} "
+              f"speakers (by speech time)")
+        speakers = speakers[:args.max_speakers]
+    print(f"[profile] global speakers kept: {len(speakers)} "
+          f"(>= {args.min_speaker_sec}s, with a clean reference; "
+          f"dropped {dropped_noref} un-cloneable)")
 
     # --- stage 4: gender/age + references + fallback pool voice ---------------
     predictor = None

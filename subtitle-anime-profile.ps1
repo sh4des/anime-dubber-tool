@@ -46,15 +46,24 @@ param(
     # so a sample of ~10-15 often captures the main characters far faster.
     [int]$MaxEpisodes = 0,
 
-    # Diarization backend + knobs (see profile_show.py).
-    [ValidateSet("auto", "pyannote", "resemblyzer")]
+    # Diarization backend (see profile_show.py). 'ecapa' = SpeechBrain, no signup,
+    # best local quality; 'resemblyzer' = already installed but crude; 'pyannote'
+    # = gated (needs a HF account). 'auto' prefers ecapa if installed.
+    [ValidateSet("auto", "ecapa", "pyannote", "resemblyzer")]
     [string]$Diarizer = "auto",
     [string]$HfToken  = "",
     [switch]$NoDemucs,
-    # Cosine DISTANCE thresholds (smaller = more distinct speakers). Tuned for
-    # resemblyzer's compressed embedding space; too high merges everyone.
-    [double]$ClusterThreshold = 0.30,
-    [double]$LocalThreshold   = 0.25,
+    # Reuse Demucs vocal stems cached in the stem dir instead of re-separating -
+    # makes threshold re-tuning fast (Demucs is the slow part).
+    [switch]$ReuseStems,
+    # Force fresh Demucs separation (clears the cached stem dir first).
+    [switch]$FreshStems,
+    # Keep at most this many speakers (by speech time); the over-split tail is noise.
+    [int]$MaxSpeakers = 40,
+    # Cosine DISTANCE thresholds (smaller = more distinct speakers). Leave unset to
+    # use profile_show.py's per-backend defaults; only pass to override.
+    [double]$ClusterThreshold,
+    [double]$LocalThreshold,
 
     [string]$Python = "python"
 )
@@ -74,12 +83,16 @@ $FF_LOGLEVEL = "info"
 if (-not $Out)     { $Out     = Join-Path $Folder "anime-dub-profile.json" }
 if (-not $ClipDir) { $ClipDir = Join-Path $Folder "anime-dub-clips" }
 if (-not $HfToken) { $HfToken = $env:HF_TOKEN }
-# pyannote (wespeaker) embeddings are more spread than resemblyzer's, so the
-# resemblyzer-tuned 0.30 would over-split. Bump the default when the user didn't
-# set it explicitly and the pyannote backend is selected.
-if (-not $PSBoundParameters.ContainsKey('ClusterThreshold') -and $Diarizer -eq 'pyannote') {
-    $ClusterThreshold = 0.50
+
+# Persistent stem dir (survives across runs) so -ReuseStems can skip Demucs when
+# re-tuning. Keyed by the show folder name so different shows don't collide.
+$showKey  = (Split-Path $Folder -Leaf) -replace '[^\w.-]', '_'
+$stemDir  = Join-Path $Scratch "dubprofile-stems_$showKey"
+if ($FreshStems -and (Test-Path -LiteralPath $stemDir)) {
+    Write-Host "Clearing cached stems: $stemDir"
+    Remove-Item -LiteralPath $stemDir -Recurse -Force
 }
+New-Item -ItemType Directory -Force $stemDir | Out-Null
 
 $VideoExtensions = @(".mkv", ".mp4", ".m4v", ".avi", ".ts")
 
@@ -114,12 +127,17 @@ if ($MaxEpisodes -gt 0 -and $episodes.Count -gt $MaxEpisodes) {
     Write-Host "Sampling first $MaxEpisodes of $($episodes.Count) episode(s)."
     $episodes = $episodes | Select-Object -First $MaxEpisodes
 }
+$thrNote = ""
+if ($PSBoundParameters.ContainsKey('ClusterThreshold')) { $thrNote += " cluster<=$ClusterThreshold" }
+if ($PSBoundParameters.ContainsKey('LocalThreshold'))   { $thrNote += " local<=$LocalThreshold" }
+if (-not $thrNote) { $thrNote = " (per-backend defaults)" }
 Write-Host "Profiling $($episodes.Count) episode(s) from $Folder"
 Write-Host "Profile out: $Out"
 Write-Host "Clip dir:    $ClipDir"
-Write-Host "Diarizer:    $Diarizer  (demucs=$(-not $NoDemucs), cluster<=$ClusterThreshold, local<=$LocalThreshold)"
-if ($Diarizer -ne 'resemblyzer' -and -not $HfToken) {
-    Write-Warning "No -HfToken/HF_TOKEN set; pyannote (gated) will fall back to resemblyzer."
+Write-Host "Diarizer:    $Diarizer  (demucs=$(-not $NoDemucs), reuse-stems=$($ReuseStems.IsPresent), max-speakers=$MaxSpeakers, thresholds:$thrNote)"
+Write-Host "Stem cache:  $stemDir"
+if ($Diarizer -eq 'pyannote' -and -not $HfToken) {
+    Write-Warning "Diarizer=pyannote but no -HfToken/HF_TOKEN set; it will fail auth."
 }
 
 $work = Join-Path $Scratch ("profile_" + [Guid]::NewGuid().ToString("N"))
@@ -164,14 +182,17 @@ try {
         "--audio-list", $listFile,
         "--out", $Out,
         "--clip-dir", $ClipDir,
-        "--scratch", (Join-Path $work "stems"),
+        "--scratch", $stemDir,
         "--diarizer", $Diarizer,
-        "--cluster-threshold", $ClusterThreshold,
-        "--local-threshold", $LocalThreshold,
+        "--max-speakers", $MaxSpeakers,
         "--verbose"
     )
-    if ($NoDemucs) { $pyArgs += "--no-demucs" }
-    if ($HfToken)  { $pyArgs += @("--hf-token", $HfToken) }
+    # Only override thresholds when the user set them; else per-backend defaults.
+    if ($PSBoundParameters.ContainsKey('ClusterThreshold')) { $pyArgs += @("--cluster-threshold", $ClusterThreshold) }
+    if ($PSBoundParameters.ContainsKey('LocalThreshold'))   { $pyArgs += @("--local-threshold", $LocalThreshold) }
+    if ($NoDemucs)   { $pyArgs += "--no-demucs" }
+    if ($ReuseStems) { $pyArgs += "--reuse-stems" }
+    if ($HfToken)    { $pyArgs += @("--hf-token", $HfToken) }
 
     Write-Host "`nBuilding profile (Demucs + diarization + clustering) - this is the slow part..."
     Write-Cmd $Python $pyArgs
