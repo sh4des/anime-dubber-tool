@@ -44,6 +44,20 @@ param(
     # Force fresh Demucs separation in Phase A (else cached stems are reused).
     [switch]$FreshStems,
 
+    # Phase B voice engine. 'indextts' (default, RECOMMENDED) = IndexTTS2 clone +
+    # emotion transfer from the original Japanese line; 'xtts' = older timbre-only
+    # clone. See subtitle-anime-unique-voices.ps1 for details.
+    [ValidateSet("indextts", "xtts")]
+    [string]$Engine = "indextts",
+    [string]$IndexTtsPython = "G:\Transcode\index-tts\.venv\Scripts\python.exe",
+    [string]$CheckpointsDir = "G:\Transcode\index-tts\checkpoints",
+    [double]$EmoAlpha = 0.7,
+
+    # Lay the English dub over a Demucs music+SFX bed (original dialogue removed)
+    # instead of ducking the full original. Passed through to Phase B.
+    [switch]$MusicBed,
+    [double]$BedVolume = 0.9,
+
     # Passed through to Phase B.
     [switch]$BackupOriginal,     # keep <name>.pre-dub.<ext> before replacing
     [switch]$UseDubbedFolder,    # write to <Folder>\dubbed\ instead of in place
@@ -51,7 +65,11 @@ param(
 
     # Advanced: cap Phase A to the first N episodes (0 = all). The full show gives
     # the best cast + lets every episode use the fast time-overlap dub path.
-    [int]$ProfileEpisodes = 0
+    [int]$ProfileEpisodes = 0,
+
+    # Render order for Phase B: start at the first episode matching this substring
+    # and wrap earlier episodes to the end (e.g. "S01E20" => E20..end, then E01..E19).
+    [string]$StartFrom = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -101,6 +119,7 @@ Write-Host "`n=== PHASE B: dubbing every episode (cloned voices) ===" -Foregroun
 $pb = @{
     Folder       = $Folder
     Clone        = $true
+    Engine       = $Engine
     CloneProfile = $profileJson
     Redub        = $true       # rebuild existing AI tracks; resume-safe per engine
     All          = $true       # whole folder, no per-episode prompt
@@ -108,9 +127,16 @@ $pb = @{
     Python       = $Python
     Mkvmerge     = $Mkvmerge
 }
+if ($Engine -eq "indextts") {
+    $pb.IndexTtsPython = $IndexTtsPython
+    $pb.CheckpointsDir = $CheckpointsDir
+    $pb.EmoAlpha       = $EmoAlpha
+}
 if (-not $NoFit)        { $pb.FitToCues      = $true }
 if ($BackupOriginal)    { $pb.BackupOriginal = $true }
 if ($UseDubbedFolder)   { $pb.UseDubbedFolder = $true }
+if ($StartFrom)         { $pb.StartFrom      = $StartFrom }
+if ($MusicBed)          { $pb.MusicBed = $true; $pb.BedVolume = $BedVolume }
 & $dubScript @pb
 
 $overall.Stop()

@@ -71,6 +71,11 @@ param(
 $ErrorActionPreference = "Stop"
 if (-not $PSBoundParameters.ContainsKey('Verbose')) { $VerbosePreference = 'Continue' }
 
+# Stream profile_show.py's progress live: Python block-buffers stdout when it is
+# piped/redirected (e.g. tee'd to a log), so [profile] lines would otherwise only
+# appear in ~8KB bursts / at exit. Unbuffered = real-time per-episode output.
+$env:PYTHONUNBUFFERED = "1"
+
 $FFMPEG  = "ffmpeg"
 $FFPROBE = "ffprobe"
 if (-not $PSBoundParameters.ContainsKey('Python')) {
@@ -156,7 +161,7 @@ try {
         Write-Host "`n[$n/$($episodes.Count)] extracting audio: $($ep.Name)"
         # Tolerant decode (some anime MKVs abort a strict demux). 44.1k stereo so
         # Demucs separates well; profile_show.py downsamples internally.
-        $ffArgs = @("-y", "-v", $FF_LOGLEVEL, "-stats",
+        $ffArgs = @("-y", "-nostdin", "-v", $FF_LOGLEVEL, "-stats",
                     "-fflags", "+genpts+discardcorrupt", "-err_detect", "ignore_err",
                     "-i", $ep.FullName, "-map", "0:a:$RefAudioIndex",
                     "-ac", "2", "-ar", "44100", "-c:a", "pcm_s16le", $wav)

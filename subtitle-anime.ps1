@@ -218,7 +218,7 @@ function Export-Subtitle {
 
     $outSrt = Join-Path $WorkDir "$Base.extracted.srt"
     Write-Host "  subtitle: $($Plan.Desc) -> srt"
-    $exArgs = @("-y", "-v", $FF_LOGLEVEL, "-i", $ExtractFrom, "-map", "0:s:$($Plan.RelIndex)", "-c:s", "srt", $outSrt)
+    $exArgs = @("-y", "-nostdin", "-v", $FF_LOGLEVEL, "-i", $ExtractFrom, "-map", "0:s:$($Plan.RelIndex)", "-c:s", "srt", $outSrt)
     Write-Cmd $FFMPEG $exArgs
     & $FFMPEG @exArgs
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $outSrt)) {
@@ -302,7 +302,7 @@ function Merge-DubIntoVideo {
     Write-Verbose "  [pass 1] rendering mixed English track: dub@100% + original@$([int]($OriginalVolume*100))% (stereo, 48kHz AAC)"
     Write-Verbose "  filter: $filter"
     $p1 = @(
-        "-y", "-v", $FF_LOGLEVEL, "-stats",
+        "-y", "-nostdin", "-v", $FF_LOGLEVEL, "-stats",
         "-i", $Video,
         "-i", $DubWav,
         "-filter_complex", $filter,
@@ -321,7 +321,7 @@ function Merge-DubIntoVideo {
     # (copied from the clean AAC) + subs + attachments. No re-encode.
     Write-Verbose "  [pass 2] copy-muxing: video + $origAudioCount original audio + English track a:$newIdx (default)"
     $p2 = @(
-        "-y", "-v", $FF_LOGLEVEL, "-stats",
+        "-y", "-nostdin", "-v", $FF_LOGLEVEL, "-stats",
         "-i", $Video,
         "-i", $mixedAac,
         "-map", "0:v",

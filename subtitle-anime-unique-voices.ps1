@@ -77,6 +77,14 @@ param(
     # Volume the original audio is mixed down to under the English dub (0.6 = 60%).
     [double]$OriginalVolume = 0.6,
 
+    # Lay the English dub over a Demucs-isolated MUSIC+SFX bed (original dialogue
+    # removed) instead of ducking the full original. Eliminates Japanese-voice
+    # bleed while keeping score + sound effects. Adds ~1-2 min/episode (Demucs).
+    [switch]$MusicBed,
+    # Volume of the music+SFX bed under the dub when -MusicBed (no competing
+    # dialogue, so it can sit higher than the -OriginalVolume duck).
+    [double]$BedVolume = 0.9,
+
     # --- persistent character profile (show-level) ---------------------------
     # One JSON per show; recurring characters keep their voice across episodes.
     # Delete it to reset the cast; back it up before re-running to reuse it.
@@ -133,6 +141,41 @@ param(
     # Speed up dub lines that overrun the next subtitle cue (keeps lip-ish sync).
     [switch]$FitToCues,
 
+    # --- cloned-engine selector (only used with -Clone) ----------------------
+    # 'indextts' (default, RECOMMENDED): IndexTTS2 - clones each character's
+    #   timbre AND transfers the emotion/tone of their ORIGINAL Japanese line
+    #   (srt_to_speech_indextts.py, runs in its own Python 3.10/3.11 venv).
+    # 'xtts': the older Coqui XTTS clone (srt_to_speech_cloned.py, timbre only).
+    [ValidateSet('indextts', 'xtts')]
+    [string]$Engine = 'indextts',
+    # Python interpreter for the IndexTTS2 venv (separate from -Python, which runs
+    # ffprobe helpers / the XTTS+profiler 3.12 stack).
+    [string]$IndexTtsPython = "G:\Transcode\index-tts\.venv\Scripts\python.exe",
+    # IndexTTS2 checkpoints dir (config.yaml + weights).
+    [string]$CheckpointsDir = "G:\Transcode\index-tts\checkpoints",
+    # Emotion transfer strength 0..1 for IndexTTS2 (0 = neutral clone).
+    [double]$EmoAlpha = 0.7,
+
+    # Process ONLY episodes whose filename contains one of these substrings
+    # (e.g. "S01E20") - handy for a single-episode pilot. Empty = all episodes.
+    [string[]]$OnlyEpisodes = @(),
+    # Rotate the (name-sorted) episode order to START at the first episode whose
+    # name contains this substring, wrapping earlier episodes to the end. E.g.
+    # -StartFrom "S01E20" processes E20..end, then E01..E19.
+    [string]$StartFrom = "",
+
+    # Reuse a previously-rendered dub WAV (skip the slow TTS render) if one is
+    # cached for this episode - lets you re-run the mux/install step without
+    # re-rendering. The cache is ALWAYS written after a successful render, keyed
+    # by episode name, under <Scratch>\dubwav-cache. Omit to always render fresh.
+    [switch]$ReuseDub,
+
+    # Reprocess an episode even if it already carries THIS engine's dub track
+    # (bypasses the resume-safe skip). Use when re-testing mix settings on an
+    # episode already dubbed by this engine. Do NOT use for the full run - the
+    # resume skip is what makes an interrupted run continue instead of redoing.
+    [switch]$Force,
+
     # Local fast disk used as scratch (source copied here to avoid slow network
     # reads/writes; result copied back after).
     [string]$Scratch = ([IO.Path]::GetTempPath()),
@@ -173,8 +216,9 @@ if (-not $PSBoundParameters.ContainsKey('Mkvmerge')) {
     }
 }
 $MKVMERGE = $Mkvmerge
-$TTS_SCRIPT   = Join-Path $PSScriptRoot "srt_to_speech_multivoice.py"
-$CLONE_SCRIPT = Join-Path $PSScriptRoot "srt_to_speech_cloned.py"
+$TTS_SCRIPT      = Join-Path $PSScriptRoot "srt_to_speech_multivoice.py"
+$CLONE_SCRIPT    = Join-Path $PSScriptRoot "srt_to_speech_cloned.py"
+$INDEXTTS_SCRIPT = Join-Path $PSScriptRoot "srt_to_speech_indextts.py"
 
 # ffmpeg log level: 'info' shows what it's doing without the per-frame firehose.
 $FF_LOGLEVEL = "info"
@@ -190,10 +234,18 @@ $VideoExtensions = @(".mkv", ".mp4", ".m4v", ".avi", ".ts")
 $TextSubCodecs   = @("subrip", "srt", "ass", "ssa", "mov_text", "webvtt", "text")
 
 # Written on every AI dub audio track; used to detect completed episodes on re-run.
-$DubTrackTitlePrefix = "English Dub (AI)"
+# NOTE: no closing ')' - the real titles continue past it ("English Dub (AI,
+# multi-voice)", "...(AI, cloned+emotion)"), so a prefix WITH the ')' matched only
+# the bare basic-engine title and silently broke marker detection + stale-track
+# dropping for the multi-voice/cloned engines.
+$DubTrackTitlePrefix = "English Dub (AI"
 # Full title stamped on the new audio track (still starts with the prefix so
 # re-run detection + -Redub stripping keep working).
-$DubTrackTitle = if ($Clone) { "English Dub (AI, cloned)" } else { "English Dub (AI, multi-voice)" }
+$DubTrackTitle =
+    if ($Clone) {
+        if ($Engine -eq 'indextts') { "English Dub (AI, cloned+emotion)" }
+        else { "English Dub (AI, cloned)" }
+    } else { "English Dub (AI, multi-voice)" }
 
 # Where finished files go when -UseDubbedFolder is set.
 $OutputDir = Join-Path $Folder "dubbed"
@@ -207,7 +259,17 @@ if ($Clone) {
     if (-not (Test-Path -LiteralPath $CloneProfile)) {
         throw "-Clone requires a Phase A profile; not found: $CloneProfile`n  Build it first with subtitle-anime-profile.ps1"
     }
-    if (-not (Test-Path -LiteralPath $CLONE_SCRIPT)) { throw "Missing $CLONE_SCRIPT" }
+    if ($Engine -eq 'indextts') {
+        if (-not (Test-Path -LiteralPath $INDEXTTS_SCRIPT)) { throw "Missing $INDEXTTS_SCRIPT" }
+        if (-not (Test-Path -LiteralPath $IndexTtsPython)) {
+            throw "-Engine indextts requires the IndexTTS2 venv python: $IndexTtsPython`n  Build it with: cd G:\Transcode\index-tts; uv sync"
+        }
+        if (-not (Test-Path -LiteralPath (Join-Path $CheckpointsDir "config.yaml"))) {
+            throw "-Engine indextts: no config.yaml in $CheckpointsDir`n  Download weights: hf download IndexTeam/IndexTTS-2 --local-dir $CheckpointsDir"
+        }
+    } else {
+        if (-not (Test-Path -LiteralPath $CLONE_SCRIPT)) { throw "Missing $CLONE_SCRIPT" }
+    }
 }
 
 
@@ -344,7 +406,7 @@ function Repair-Container {
     # worth a second shot before giving up on the file.
     if (-not $mkOk) {
         Remove-Item -LiteralPath $fixed -Force -ErrorAction SilentlyContinue
-        $ffArgs = @("-y", "-v", $FF_LOGLEVEL, "-stats",
+        $ffArgs = @("-y", "-nostdin", "-v", $FF_LOGLEVEL, "-stats",
                     "-fflags", "+genpts+discardcorrupt", "-err_detect", "ignore_err",
                     "-i", $InVideo, "-map", "0", "-c", "copy",
                     "-max_interleave_delta", "0", $fixed)
@@ -417,7 +479,7 @@ function Export-Subtitle {
 
     $outSrt = Join-Path $WorkDir "$Base.extracted.srt"
     Write-Host "  subtitle: $($Plan.Desc) -> srt"
-    $exArgs = @("-y", "-v", $FF_LOGLEVEL, "-i", $ExtractFrom, "-map", "0:s:$($Plan.RelIndex)", "-c:s", "srt", $outSrt)
+    $exArgs = @("-y", "-nostdin", "-v", $FF_LOGLEVEL, "-i", $ExtractFrom, "-map", "0:s:$($Plan.RelIndex)", "-c:s", "srt", $outSrt)
     Write-Cmd $FFMPEG $exArgs
     & $FFMPEG @exArgs
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $outSrt)) {
@@ -436,7 +498,7 @@ function Export-ReferenceAudio {
 
     $outWav = Join-Path $WorkDir "$Base.ref.wav"
     Write-Host "  reference audio: original stream 0:a:$RefAudioIndex -> mono 16kHz wav"
-    $rfArgs = @("-y", "-v", $FF_LOGLEVEL, "-i", $ExtractFrom,
+    $rfArgs = @("-y", "-nostdin", "-v", $FF_LOGLEVEL, "-i", $ExtractFrom,
                 "-map", "0:a:$RefAudioIndex", "-ac", "1", "-ar", "16000",
                 "-c:a", "pcm_s16le", $outWav)
     Write-Cmd $FFMPEG $rfArgs
@@ -472,7 +534,36 @@ function New-DubTrack {
     param([string]$Srt, [string]$RefAudio, [double]$Duration, [string]$OutWav,
           [string]$EpisodeName)
 
-    # --- Phase B: cloned-voice engine ----------------------------------------
+    # --- Phase B: IndexTTS2 expressive cloned engine -------------------------
+    if ($Clone -and $Engine -eq 'indextts') {
+        $pyArgs = @(
+            $INDEXTTS_SCRIPT,
+            "--srt", $Srt,
+            "--out", $OutWav,
+            "--profile", $CloneProfile,
+            "--ref-audio", $RefAudio,
+            "--episode-name", $EpisodeName,
+            "--checkpoints-dir", $CheckpointsDir,
+            "--duration", $Duration,
+            "--emo-alpha", $EmoAlpha,
+            "--fp16"
+        )
+        if ($FitToCues) { $pyArgs += "--fit" }
+        $pyArgs += "--verbose"
+
+        Write-Host "  synthesizing IndexTTS2 cloned+emotion dub on GPU..."
+        Write-Cmd $IndexTtsPython $pyArgs
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        & $IndexTtsPython @pyArgs
+        $sw.Stop()
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $OutWav)) {
+            throw "IndexTTS2 generation failed for $Srt"
+        }
+        Write-Verbose ("  TTS finished in {0:n1}s -> {1}" -f $sw.Elapsed.TotalSeconds, $OutWav)
+        return
+    }
+
+    # --- Phase B: cloned-voice engine (XTTS) ---------------------------------
     if ($Clone) {
         $pyArgs = @(
             $CLONE_SCRIPT,
@@ -545,6 +636,35 @@ function New-DubTrack {
 # (dub at full volume mixed with original at $OriginalVolume) + original subs.
 # Two passes on purpose (see the basic script for the full rationale): render
 # the mixed English track to a clean AAC first, then pure copy-mux everything.
+# Isolate a MUSIC+SFX bed (original dialogue removed) from one source audio stream
+# via Demucs, so the English dub can sit over score/effects with no Japanese-voice
+# bleed. Returns the no_vocals WAV path, or $null on failure (caller falls back to
+# ducking the full original). Uses $PYTHON (the venv with demucs installed).
+function Get-MusicBed {
+    param([string]$Video, [int]$StreamRel, [string]$WorkDir)
+    $origWav = Join-Path $WorkDir "bed_source.wav"
+    $ex = @("-y", "-nostdin", "-v", "error", "-i", $Video, "-map", "0:a:$StreamRel",
+            "-ac", "2", "-ar", "44100", "-c:a", "pcm_s16le", $origWav)
+    & $FFMPEG @ex
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $origWav)) {
+        Write-Warning "  music bed: could not extract source audio; using ducked original instead"
+        return $null
+    }
+    $demucsOut = Join-Path $WorkDir "demucs"
+    Write-Verbose "  music bed: Demucs isolating music+SFX (htdemucs 2-stem, GPU) ..."
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    & $PYTHON -m demucs -n htdemucs --two-stems=vocals -d cuda -o $demucsOut $origWav 2>&1 |
+        ForEach-Object { Write-Verbose "    $_" }
+    $ok = ($LASTEXITCODE -eq 0)
+    $noVocals = Join-Path $demucsOut "htdemucs\bed_source\no_vocals.wav"
+    if (-not $ok -or -not (Test-Path -LiteralPath $noVocals)) {
+        Write-Warning "  music bed: Demucs produced no stem (exit $LASTEXITCODE); using ducked original instead"
+        return $null
+    }
+    Write-Verbose ("  music bed ready in {0:n1}s -> {1}" -f $sw.Elapsed.TotalSeconds, $noVocals)
+    return $noVocals
+}
+
 function Merge-DubIntoVideo {
     param([string]$Video, [string]$DubWav, $Probe, [string]$OutVideo, [string]$WorkDir)
 
@@ -567,17 +687,30 @@ function Merge-DubIntoVideo {
     $firstOrig = if ($keepAudioRel.Count) { $keepAudioRel[0] } else { 0 }
     $mixedAac = Join-Path $WorkDir "mixed_english.m4a"
 
-    # English track = first original(0:a:$firstOrig) at $OriginalVolume + dub(1:a).
-    $filter = "[0:a:$firstOrig]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,volume=$OriginalVolume[orig];" +
+    # Bed under the dub: a Demucs music+SFX stem (original dialogue removed) when
+    # -MusicBed, else the full original ducked. Input order: 0=video, 1=dub,
+    # and 2=bed WAV only when a Demucs stem was produced.
+    $bedWav = $null
+    if ($MusicBed) { $bedWav = Get-MusicBed -Video $Video -StreamRel $firstOrig -WorkDir $WorkDir }
+    if ($bedWav) {
+        $bedLabel = "[2:a]"; $bedVol = $BedVolume; $extraIn = @("-i", $bedWav)
+        $bedDesc = "music+SFX bed@$([int]($BedVolume*100))% (JP dialogue removed)"
+    }
+    else {
+        $bedLabel = "[0:a:$firstOrig]"; $bedVol = $OriginalVolume; $extraIn = @()
+        $bedDesc = "original@$([int]($OriginalVolume*100))%"
+    }
+    $filter = "${bedLabel}aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,volume=${bedVol}[orig];" +
               "[1:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,volume=1.0[dub];" +
               "[orig][dub]amix=inputs=2:duration=first:dropout_transition=0:normalize=0,alimiter=limit=0.95[mix]"
 
-    Write-Verbose "  [pass 1] rendering mixed English track: dub@100% + original@$([int]($OriginalVolume*100))% (stereo, 48kHz AAC)"
+    Write-Verbose "  [pass 1] rendering mixed English track: dub@100% + $bedDesc (stereo, 48kHz AAC)"
     Write-Verbose "  filter: $filter"
     $p1 = @(
-        "-y", "-v", $FF_LOGLEVEL, "-stats",
+        "-y", "-nostdin", "-v", $FF_LOGLEVEL, "-stats",
         "-i", $Video,
-        "-i", $DubWav,
+        "-i", $DubWav
+    ) + $extraIn + @(
         "-filter_complex", $filter,
         "-map", "[mix]",
         "-c:a", "aac", "-b:a", "256k", "-ar", "48000",
@@ -594,7 +727,7 @@ function Merge-DubIntoVideo {
     # (copied from the clean AAC) + subs + attachments. No re-encode.
     Write-Verbose "  [pass 2] copy-muxing: video + $origAudioCount original audio + English track a:$newIdx (default)"
     $p2 = @(
-        "-y", "-v", $FF_LOGLEVEL, "-stats",
+        "-y", "-nostdin", "-v", $FF_LOGLEVEL, "-stats",
         "-i", $Video,
         "-i", $mixedAac,
         "-map", "0:v"
@@ -644,6 +777,19 @@ function Install-DubbedEpisode {
         $outFile = $Video
     }
 
+    # Verify the freshly-built LOCAL mux carries the AI dub marker BEFORE we touch
+    # the share. This is deterministic (local disk); a network RE-probe of the
+    # uploaded copy proved flaky and produced false negatives that aborted good
+    # dubs. If the marker is genuinely absent that's a real mux bug - dump the
+    # audio titles so it is diagnosable rather than a mystery.
+    $localProbe = Invoke-FFProbeJson -Path $LocalOut
+    if (-not (Test-HasAiDubTrack $localProbe)) {
+        $titles = @($localProbe.streams | Where-Object { $_.codec_type -eq 'audio' } |
+            ForEach-Object { "a:{0}='{1}'" -f $_.index, $_.tags.title })
+        throw ("built file is missing the AI dub track marker (mux bug) - original untouched. " +
+               "Audio titles seen: $($titles -join '; ')")
+    }
+
     $partFile = "$outFile.part"
     if (Test-Path -LiteralPath $partFile) { Remove-Item -LiteralPath $partFile -Force }
 
@@ -657,11 +803,8 @@ function Install-DubbedEpisode {
         throw "transfer size mismatch ($gotLen vs $expectedLen bytes) - original untouched"
     }
 
-    $partProbe = Invoke-FFProbeJson -Path $partFile
-    if (-not (Test-HasAiDubTrack $partProbe)) {
-        Remove-Item -LiteralPath $partFile -Force -ErrorAction SilentlyContinue
-        throw "uploaded file is missing the AI dub track marker - original untouched"
-    }
+    # Marker already verified on the local source above, and the copy is
+    # size-verified byte-identical - no fragile network marker re-probe here.
 
     if ($UseDubbedFolder) {
         [System.IO.File]::Move($partFile, $outFile, $true)
@@ -707,8 +850,8 @@ function Invoke-Episode {
             Write-Host "  already has AI dub track, skipping (use -Redub to rebuild it)."
             return $true
         }
-        if (Test-HasDubVariant $probe $DubTrackTitle) {
-            Write-Host "  already rebuilt with '$DubTrackTitle' this pass, skipping (resume-safe)."
+        if (-not $Force -and (Test-HasDubVariant $probe $DubTrackTitle)) {
+            Write-Host "  already rebuilt with '$DubTrackTitle' this pass, skipping (resume-safe; use -Force to redo)."
             return $true
         }
         Write-Host "  -Redub: stripping the existing AI dub track and rebuilding." -ForegroundColor Yellow
@@ -789,9 +932,20 @@ function Invoke-Episode {
             throw ("audio still truncates at {0:n0}s of {1:n0}s after remux - refusing to ship a partial dub." -f $refDur, $dur)
         }
 
-        Write-Host "  [7/8] generating multi-voice English dub (TTS)"
+        Write-Host "  [7/8] generating English dub (TTS)"
         $dubWav = Join-Path $work "$base.dub.wav"
-        New-DubTrack -Srt $srt -RefAudio $refWav -Duration $dur -OutWav $dubWav -EpisodeName $base
+        $dubCache  = Join-Path $Scratch "dubwav-cache"
+        $cachedDub = Join-Path $dubCache "$base.dub.wav"
+        if ($ReuseDub -and (Test-Path -LiteralPath $cachedDub)) {
+            Write-Host "  reusing cached dub WAV (skipping TTS): $cachedDub" -ForegroundColor DarkGray
+            [System.IO.File]::Copy($cachedDub, $dubWav, $true)
+        }
+        else {
+            New-DubTrack -Srt $srt -RefAudio $refWav -Duration $dur -OutWav $dubWav -EpisodeName $base
+            [System.IO.Directory]::CreateDirectory($dubCache) | Out-Null
+            [System.IO.File]::Copy($dubWav, $cachedDub, $true)
+            Write-Host "  cached dub WAV -> $cachedDub" -ForegroundColor DarkGray
+        }
 
         Write-Host "  [8/8] muxing tracks (local)"
         $localOut = Join-Path $work "$base.dubbed.mkv"
@@ -860,6 +1014,31 @@ $episodes = @(
 )
 if ($episodes.Count -eq 0) { throw "No video files found in $Folder" }
 Write-Host "Found $($episodes.Count) episode(s) in $Folder"
+
+# optional: restrict to specific episodes (single-episode pilot)
+if ($OnlyEpisodes.Count) {
+    $episodes = @($episodes | Where-Object {
+            $n = $_.Name
+            ($OnlyEpisodes | Where-Object { $n -like "*$_*" }).Count -gt 0
+        })
+    if ($episodes.Count -eq 0) { throw "No episodes match -OnlyEpisodes: $($OnlyEpisodes -join ', ')" }
+    Write-Host "Restricted to $($episodes.Count) episode(s) via -OnlyEpisodes."
+}
+# optional: rotate so processing starts at -StartFrom and wraps to the front
+# (e.g. -StartFrom 'S01E20' => E20..end, then E01..E19).
+if ($StartFrom) {
+    $idx = -1
+    for ($i = 0; $i -lt $episodes.Count; $i++) {
+        if ($episodes[$i].Name -like "*$StartFrom*") { $idx = $i; break }
+    }
+    if ($idx -gt 0) {
+        $episodes = @($episodes[$idx..($episodes.Count - 1)]) + @($episodes[0..($idx - 1)])
+        Write-Host "Rotated order to start at '$StartFrom' (wrapping earlier episodes to the end)."
+    }
+    elseif ($idx -lt 0) {
+        Write-Warning "-StartFrom '$StartFrom' matched no episode; using natural order."
+    }
+}
 
 # 1) test on a single episode first
 if (-not $All) {

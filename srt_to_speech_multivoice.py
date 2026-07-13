@@ -311,9 +311,11 @@ class AgeGenderPredictor:
             print(f"[tts] age+gender model loaded: {self.model_name} "
                   f"(device={self.device})")
         except Exception as e:
+            import traceback
             print(f"[tts] WARNING: could not load age+gender model "
-                  f"({type(e).__name__}: {e}); falling back to pitch buckets "
-                  f"for gender/age.", file=sys.stderr)
+                  f"({type(e).__name__}: {e}); falling back to measured-pitch "
+                  f"buckets for gender/age. Full traceback:", file=sys.stderr)
+            traceback.print_exc()
             self.ok = False
         return self.ok
 

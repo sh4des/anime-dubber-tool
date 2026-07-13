@@ -57,7 +57,7 @@ os.environ.setdefault("COQUI_TOS_AGREED", "1")
 try:
     from srt_to_speech_multivoice import (
         AgeGenderPredictor, gender_label, classify_bucket_model,
-        classify_bucket_pitch, AGE_GENDER_MODEL, VOICE_POOLS)
+        classify_bucket_pitch, voiced_median_pitch, AGE_GENDER_MODEL, VOICE_POOLS)
 except Exception as e:   # pragma: no cover - only if the sibling file moved
     print(f"[profile] FATAL: cannot import srt_to_speech_multivoice ({e})",
           file=sys.stderr)
@@ -155,8 +155,19 @@ def normalize_rows(x):
     return x / norms
 
 
-def agglomerative_cosine(embs, threshold):
-    """Cluster row-embeddings by cosine distance. Returns integer labels (1..k)."""
+def agglomerative_cosine(embs, threshold, method="average"):
+    """Cluster row-embeddings by cosine distance. Returns integer labels (1..k).
+
+    Default 'average' matches the per-episode window diarizer's original tuning
+    (complete linkage is far too strict at the window level and over-splits into
+    hundreds of one-window "speakers"). The GLOBAL speaker clustering passes
+    method='complete' explicitly (via --linkage) to resist the chaining that made
+    average linkage collapse most of the cast into one blob - complete only merges
+    two clusters when ALL members are within threshold, so clusters stay tight.
+    'ward' is also available: it feeds Euclidean distances of the L2-normalized
+    rows (== sqrt(2*(1-cos)), monotonic in cosine), since ward needs Euclidean
+    geometry.
+    """
     import numpy as np
     from scipy.cluster.hierarchy import linkage, fcluster
     from scipy.spatial.distance import pdist
@@ -166,9 +177,66 @@ def agglomerative_cosine(embs, threshold):
     if n == 1:
         return np.array([1], dtype=int)
     X = normalize_rows(embs)
-    d = pdist(X, metric="cosine")
-    Z = linkage(d, method="average")
+    d = pdist(X, metric="euclidean" if method == "ward" else "cosine")
+    Z = linkage(d, method=method)
     return fcluster(Z, t=threshold, criterion="distance")
+
+
+def merge_close_speakers(speakers, thr):
+    """Recombine global speakers whose centroids are within cosine distance `thr`.
+
+    Fixes the main cause of scene-to-scene voice drift: one character split
+    across several clusters (loud vs quiet delivery drifts the per-episode
+    embedding). Iteratively merges the closest pair under the threshold until
+    none remain. Each speaker is {"members","dur","centroid"}.
+    """
+    import numpy as np
+    if thr is None or thr <= 0:
+        return speakers
+    speakers = list(speakers)
+    while len(speakers) > 1:
+        cents = normalize_rows(np.stack([s["centroid"] for s in speakers]))
+        best = None
+        for i in range(len(speakers)):
+            for j in range(i + 1, len(speakers)):
+                dist = 1.0 - float(np.dot(cents[i], cents[j]))
+                if dist < thr and (best is None or dist < best[0]):
+                    best = (dist, i, j)
+        if best is None:
+            break
+        _, i, j = best
+        members = speakers[i]["members"] + speakers[j]["members"]
+        merged = {
+            "members": members,
+            "dur": speakers[i]["dur"] + speakers[j]["dur"],
+            "centroid": np.mean(np.stack([m["emb"] for m in members]), axis=0),
+        }
+        speakers = [s for k, s in enumerate(speakers) if k not in (i, j)]
+        speakers.append(merged)
+    return speakers
+
+
+def cluster_to_k(embs, k, method="ward"):
+    """Cut the dendrogram to exactly k clusters (maxclust), not a distance.
+
+    The per-episode diarizer over-segments into thousands of window-level
+    fragments; no single cosine-distance cut cleanly recovers the cast from them
+    (too small -> one chained blob, too large -> thousands of singletons). Asking
+    for a fixed cluster COUNT is robust to that. 'ward' (on Euclidean distances of
+    L2-normalized rows) gives the most balanced clusters.
+    """
+    import numpy as np
+    from scipy.cluster.hierarchy import linkage, fcluster
+    from scipy.spatial.distance import pdist
+    n = len(embs)
+    if n == 0:
+        return np.array([], dtype=int)
+    if n <= k:
+        return np.arange(1, n + 1, dtype=int)
+    X = normalize_rows(embs)
+    d = pdist(X, metric="euclidean" if method == "ward" else "cosine")
+    Z = linkage(d, method=method)
+    return fcluster(Z, t=k, criterion="maxclust")
 
 
 # --- stage 1: dialogue isolation (Demucs) -------------------------------------
@@ -433,6 +501,23 @@ def main() -> int:
     ap.add_argument("--local-threshold", type=float, default=None,
                     help="cosine distance for per-episode window clustering. "
                          "Default is per-backend.")
+    ap.add_argument("--linkage", choices=["complete", "average", "ward"],
+                    default="ward",
+                    help="global clustering linkage for the maxclust cut. 'ward' "
+                         "(default) gives the most balanced clusters.")
+    ap.add_argument("--global-clusters", type=int, default=0,
+                    help="target number of global clusters to cut to before "
+                         "pruning (0 = auto = 3x --max-speakers). Deterministic "
+                         "maxclust cut, robust to the over-segmented locals.")
+    ap.add_argument("--merge-threshold", type=float, default=0.25,
+                    help="after clustering, merge two global speakers whose "
+                         "centroids are within this cosine distance (recombines a "
+                         "character split across clusters; 0 disables).")
+    ap.add_argument("--reuse-locals", action="store_true",
+                    help="skip Demucs+diarization and reuse cached per-episode "
+                         "embeddings (locals_cache.pkl in the stem dir) - lets you "
+                         "re-tune the global clustering in seconds. Requires a "
+                         "prior full run that wrote the cache.")
 
     ap.add_argument("--top-k-refs", type=int, default=4,
                     help="reference clips saved per speaker")
@@ -445,6 +530,9 @@ def main() -> int:
     # age/gender (fallback pool assignment); same knobs as the dub script.
     ap.add_argument("--age-gender-model", default=AGE_GENDER_MODEL)
     ap.add_argument("--no-age-gender", action="store_true")
+    ap.add_argument("--require-age-gender", action="store_true",
+                    help="fail fast if the age+gender model cannot load, instead "
+                         "of silently degrading to the pitch fallback.")
     ap.add_argument("--elder-age", type=float, default=58.0)
     ap.add_argument("--male-max", type=float, default=155.0)
     ap.add_argument("--adult-female-max", type=float, default=250.0)
@@ -546,10 +634,24 @@ def main() -> int:
     # We keep each episode's TARGET_SR mono array on disk (as the stem wav) so we
     # can slice reference clips AFTER global clustering, without holding every
     # episode's audio in RAM at once.
+    locals_cache = os.path.join(scratch, "locals_cache.pkl")
     local_speakers = []     # flat list across episodes
     ep_stub = []            # (name, stem_wav_path, sr)
     backends_used = set()   # which diarizer actually produced speakers
+    reused_locals = False
+    if args.reuse_locals and os.path.exists(locals_cache):
+        import pickle
+        with open(locals_cache, "rb") as f:
+            cached = pickle.load(f)
+        local_speakers = cached["local_speakers"]
+        ep_stub = cached["ep_stub"]
+        backends_used = set(cached.get("backends_used") or [backend])
+        reused_locals = True
+        print(f"[profile] --reuse-locals: loaded {len(local_speakers)} local "
+              f"speaker(s) from {len(ep_stub)} episode(s); skipping diarization")
     for wav_path, name in episodes:
+        if reused_locals:
+            break
         print(f"[profile] === {name} ===")
         if not os.path.exists(wav_path):
             print(f"[profile]   missing audio {wav_path}, skipping.",
@@ -595,17 +697,30 @@ def main() -> int:
             local_speakers.append(ls)
         # NOTE: vocal stems are kept in --scratch for --reuse-stems on re-tuning.
 
+    if not reused_locals and local_speakers:
+        import pickle
+        with open(locals_cache, "wb") as f:
+            pickle.dump({"local_speakers": local_speakers, "ep_stub": ep_stub,
+                         "backends_used": list(backends_used)}, f)
+        print(f"[profile] cached {len(local_speakers)} local embedding(s) -> "
+              f"{locals_cache}")
+
     if not local_speakers:
         print("[profile] no speakers found in any episode.", file=sys.stderr)
         return 2
 
     # --- stage 3: GLOBAL clustering across the whole show ---------------------
+    # Cut to a fixed NUMBER of clusters (maxclust), not a distance: robust to the
+    # over-segmented locals. Ask for ~3x the final cap so noise clusters can be
+    # pruned by speech time afterwards.
     embs = np.stack([ls["emb"] for ls in local_speakers])
-    glabels = agglomerative_cosine(embs, args.cluster_threshold)
+    target_k = args.global_clusters or min(3 * args.max_speakers, len(local_speakers))
+    glabels = cluster_to_k(embs, target_k, method=args.linkage)
     groups = {}
     for ls, g in zip(local_speakers, glabels):
         groups.setdefault(int(g), []).append(ls)
-    print(f"[profile] global speakers before pruning: {len(groups)}")
+    print(f"[profile] global clusters ({args.linkage} linkage, "
+          f"maxclust={target_k}): {len(groups)}")
 
     # aggregate per global speaker
     speakers = []
@@ -613,6 +728,16 @@ def main() -> int:
         total = sum(m["dur"] for m in members)
         centroid = np.mean(np.stack([m["emb"] for m in members]), axis=0)
         speakers.append({"members": members, "dur": total, "centroid": centroid})
+
+    # refinement: recombine a character split across clusters (drift fix). Bounded
+    # - merge is O(n^2) per merge, so only run it on the already-capped cluster set.
+    if len(speakers) <= 400:
+        before_merge = len(speakers)
+        speakers = merge_close_speakers(speakers, args.merge_threshold)
+        if len(speakers) < before_merge:
+            print(f"[profile] merged {before_merge} -> {len(speakers)} speakers "
+                  f"(centroids within {args.merge_threshold} cosine)")
+
     speakers = [s for s in speakers if s["dur"] >= args.min_speaker_sec]
     speakers.sort(key=lambda s: -s["dur"])
 
@@ -641,6 +766,11 @@ def main() -> int:
     predictor = None
     if not args.no_age_gender:
         predictor = AgeGenderPredictor(args.age_gender_model, device)
+        if args.require_age_gender and not predictor._load():
+            print("[profile] FATAL: --require-age-gender set but the age+gender "
+                  "model failed to load (see the traceback above).",
+                  file=sys.stderr)
+            return 4
 
     used_pool = {b: set() for b in VOICE_POOLS}
 
@@ -668,16 +798,26 @@ def main() -> int:
 
         # gender/age
         age, gender, bucket = None, None, None
-        if predictor is not None and ref_audio:
-            concat = np.concatenate(ref_audio).astype("float32")
+        concat = (np.concatenate(ref_audio).astype("float32")
+                  if ref_audio else None)
+        if predictor is not None and concat is not None:
             age, g = predictor.predict(concat, TARGET_SR)
             if g is not None:
                 gender = gender_label(g)
                 bucket = classify_bucket_model(age, g, args.elder_age)
         if bucket is None:
-            bucket = classify_bucket_pitch(None, args.male_max,
+            # Model off/failed: measure a REAL median F0 from this speaker's
+            # clean speech and use the pitch fallback, so we never blindly
+            # bucket everyone adult_male (the old bug passed a literal None).
+            f0 = None
+            if concat is not None:
+                import torch
+                f0 = voiced_median_pitch(torch.from_numpy(concat), TARGET_SR)
+            bucket = classify_bucket_pitch(f0, args.male_max,
                                            args.adult_female_max,
                                            args.child_split)
+            if gender is None and f0 is not None:
+                gender = "female" if "female" in bucket else "male"
 
         # distinct fallback pool voice (global dedup - better than online)
         pool = VOICE_POOLS[bucket]
@@ -726,17 +866,33 @@ def main() -> int:
     os.replace(tmp, args.out)
     print(f"[profile] wrote {args.out}  ({len(out_speakers)} speakers)")
 
+    # nearest-neighbour centroid distance per speaker: a small value means two
+    # clusters look like the same character (over-split / a drift risk that the
+    # merge pass did not catch). A useful sanity signal in automatic mode.
+    nearest = {}
+    if len(out_speakers) > 1:
+        C = normalize_rows(np.array([sp["centroid"] for sp in out_speakers]))
+        sims = C @ C.T
+        np.fill_diagonal(sims, -1.0)
+        for idx, sp in enumerate(out_speakers):
+            nearest[sp["id"]] = 1.0 - float(sims[idx].max())
+
     qc = os.path.splitext(args.out)[0] + ".qc.txt"
     with open(qc, "w", encoding="utf-8") as f:
         f.write(f"Voice profile QC - {len(out_speakers)} speakers\n")
-        f.write(f"diarizer={payload['diarizer']} demucs={payload['demucs']}\n\n")
+        f.write(f"diarizer={payload['diarizer']} demucs={payload['demucs']} "
+                f"linkage={args.linkage} cluster_thr={args.cluster_threshold} "
+                f"merge_thr={args.merge_threshold}\n")
+        f.write("('near' = cosine distance to the most similar other speaker; "
+                "small = possible over-split)\n\n")
         f.write(f"{'spk':>4} {'bucket':<14} {'gender':<7} {'age':>4} "
-                f"{'speech':>8} {'refs':>4}  fallback_voice\n")
+                f"{'speech':>8} {'refs':>4} {'near':>5}  fallback_voice\n")
         for sp in out_speakers:
             f.write(f"{sp['id']:>4} {sp['bucket']:<14} "
                     f"{(sp['gender'] or '?'):<7} "
                     f"{(('%.0f' % sp['age']) if sp['age'] else '-'):>4} "
-                    f"{sp['total_speech_sec']:>7.0f}s {sp['n_references']:>4}  "
+                    f"{sp['total_speech_sec']:>7.0f}s {sp['n_references']:>4} "
+                    f"{nearest.get(sp['id'], float('nan')):>5.2f}  "
                     f"{sp['fallback_voice']}\n")
     print(f"[profile] wrote QC report {qc}")
     print("[profile] NOTE: listen to a few clips in the clip dir to sanity-check "

@@ -31,6 +31,31 @@ $V = "G:\Transcode\.venv-dub\Scripts\python.exe"
 
 
 # =============================================================================
+# variant 4 engine: IndexTTS2  (RECOMMENDED expressive cloned dub)
+# =============================================================================
+# IndexTTS2 clones each character's timbre AND transfers the emotion/tone of their
+# ORIGINAL Japanese line (emo_audio_prompt), guided by the subtitle text. It needs
+# its OWN venv: it pins Python 3.10/3.11 + transformers 4.52 + numpy 1.26, which
+# conflict with the coqui/demucs stack in .venv-dub above. Fully local, no signup
+# (Bilibili license permits personal use; weights download anonymously).
+#
+# uv manages the env + a matching Python (no admin, no system 3.11 needed):
+py -3.12 -m pip install uv                              # or: winget install astral-sh.uv
+git clone https://github.com/index-tts/index-tts.git "G:\Transcode\index-tts"
+Push-Location "G:\Transcode\index-tts"
+uv sync                                                 # builds .venv (py3.10, torch cu128, indextts)
+uv pip install srt                                      # extra dep for the dub engine (numpy/librosa/soundfile come with indextts)
+hf download IndexTeam/IndexTTS-2 --local-dir "G:\Transcode\index-tts\checkpoints"
+Pop-Location
+# smoke check:
+& "G:\Transcode\index-tts\.venv\Scripts\python.exe" -c "from indextts.infer_v2 import IndexTTS2; print('IndexTTS2 import OK')"
+# The dub scripts default to this engine and expect:
+#   IndexTtsPython = G:\Transcode\index-tts\.venv\Scripts\python.exe
+#   CheckpointsDir = G:\Transcode\index-tts\checkpoints
+# (override with -IndexTtsPython / -CheckpointsDir if you install elsewhere).
+
+
+# =============================================================================
 # run script  (env + shared args - used by every variant below)
 # =============================================================================
 $env:TTS_HOME = "G:\Transcode\tts-cache"   # XTTS model cache off C:
