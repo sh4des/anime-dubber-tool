@@ -291,10 +291,16 @@ def _speech_windows(mono, sr, win_s=1.5, hop_s=0.75):
             out.append((a, b))
             continue
         t = a
+        tiled = False
         while t + win <= b:
             out.append((t, t + win))
             t += hop
-        if out[-1][1] < b - int(0.3 * sr):
+            tiled = True
+        if not tiled:
+            # region between 0.6s and win (1.5s): the while loop tiled nothing,
+            # so take the whole region (and never index an empty/foreign out[-1]).
+            out.append((a, b))
+        elif out[-1][1] < b - int(0.3 * sr):
             out.append((max(a, b - win), b))
     return out
 

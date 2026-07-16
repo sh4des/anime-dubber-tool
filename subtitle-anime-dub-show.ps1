@@ -51,7 +51,11 @@ param(
     [string]$Engine = "indextts",
     [string]$IndexTtsPython = "G:\Transcode\index-tts\.venv\Scripts\python.exe",
     [string]$CheckpointsDir = "G:\Transcode\index-tts\checkpoints",
-    [double]$EmoAlpha = 0.7,
+    [double]$EmoAlpha = 0.45,
+    # Demucs-isolated vocal stems dir (<base>.vocals.wav from Phase A). When set,
+    # IndexTTS2 takes its emotion reference from the clean vocal stem instead of
+    # the raw mix, removing the reverb/echo bleed. Passed through to Phase B.
+    [string]$EmotionStemsDir = "",
 
     # Lay the English dub over a Demucs music+SFX bed (original dialogue removed)
     # instead of ducking the full original. Passed through to Phase B.
@@ -131,6 +135,7 @@ if ($Engine -eq "indextts") {
     $pb.IndexTtsPython = $IndexTtsPython
     $pb.CheckpointsDir = $CheckpointsDir
     $pb.EmoAlpha       = $EmoAlpha
+    if ($EmotionStemsDir) { $pb.EmotionStemsDir = $EmotionStemsDir }
 }
 if (-not $NoFit)        { $pb.FitToCues      = $true }
 if ($BackupOriginal)    { $pb.BackupOriginal = $true }

@@ -153,12 +153,30 @@ param(
     [string]$IndexTtsPython = "G:\Transcode\index-tts\.venv\Scripts\python.exe",
     # IndexTTS2 checkpoints dir (config.yaml + weights).
     [string]$CheckpointsDir = "G:\Transcode\index-tts\checkpoints",
-    # Emotion transfer strength 0..1 for IndexTTS2 (0 = neutral clone).
-    [double]$EmoAlpha = 0.7,
+    # Emotion transfer strength 0..1 for IndexTTS2 (0 = neutral clone). Kept
+    # moderate: at high alpha IndexTTS2 bleeds the emotion prompt's ACOUSTICS
+    # (room reverb/echo) into the clone, not just its prosody.
+    [double]$EmoAlpha = 0.45,
+
+    # Directory of Demucs-isolated per-episode vocal stems ("<base>.vocals.wav",
+    # produced by Phase A profiling). When set, the IndexTTS2 emotion reference is
+    # taken from the CLEAN vocal stem instead of the raw original mix - this
+    # removes the music/reverb bleed that otherwise makes the cloned voices sound
+    # echoey. Empty = use the raw mixed ref (legacy behavior).
+    [string]$EmotionStemsDir = "",
+
+    # JSON of per-character + global voice knobs (emo_alpha, gain_db, temperature,
+    # max_text_tokens_per_segment, seed, no_split_under, target_peak, loudnorm).
+    # Passed to the IndexTTS2 engine; 'loudnorm' here also gates the final EBU
+    # loudness pass on the dub in the mux.
+    [string]$VoiceTuning = "",
 
     # Process ONLY episodes whose filename contains one of these substrings
     # (e.g. "S01E20") - handy for a single-episode pilot. Empty = all episodes.
     [string[]]$OnlyEpisodes = @(),
+    # Skip episodes whose filename contains any of these substrings (e.g.
+    # "S01E20" to leave an already-good episode untouched during a -Force redo).
+    [string[]]$ExcludeEpisodes = @(),
     # Rotate the (name-sorted) episode order to START at the first episode whose
     # name contains this substring, wrapping earlier episodes to the end. E.g.
     # -StartFrom "S01E20" processes E20..end, then E01..E19.
@@ -548,6 +566,9 @@ function New-DubTrack {
             "--emo-alpha", $EmoAlpha,
             "--fp16"
         )
+        if ($VoiceTuning -and (Test-Path -LiteralPath $VoiceTuning)) {
+            $pyArgs += @("--voice-tuning", $VoiceTuning)
+        }
         if ($FitToCues) { $pyArgs += "--fit" }
         $pyArgs += "--verbose"
 
@@ -700,8 +721,17 @@ function Merge-DubIntoVideo {
         $bedLabel = "[0:a:$firstOrig]"; $bedVol = $OriginalVolume; $extraIn = @()
         $bedDesc = "original@$([int]($OriginalVolume*100))%"
     }
+    # Optional EBU R128 loudness pass on the dub for episode-to-episode balance
+    # (gated by "loudnorm": true in the voice-tuning JSON).
+    $dubLoud = ""
+    if ($VoiceTuning -and (Test-Path -LiteralPath $VoiceTuning)) {
+        try {
+            $vt = Get-Content -LiteralPath $VoiceTuning -Raw | ConvertFrom-Json
+            if ($vt.global.loudnorm) { $dubLoud = ",loudnorm=I=-16:TP=-1.5:LRA=11" }
+        } catch { Write-Warning "  could not parse VoiceTuning for loudnorm flag: $_" }
+    }
     $filter = "${bedLabel}aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,volume=${bedVol}[orig];" +
-              "[1:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,volume=1.0[dub];" +
+              "[1:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,volume=1.0${dubLoud}[dub];" +
               "[orig][dub]amix=inputs=2:duration=first:dropout_transition=0:normalize=0,alimiter=limit=0.95[mix]"
 
     Write-Verbose "  [pass 1] rendering mixed English track: dub@100% + $bedDesc (stereo, 48kHz AAC)"
@@ -941,7 +971,33 @@ function Invoke-Episode {
             [System.IO.File]::Copy($cachedDub, $dubWav, $true)
         }
         else {
-            New-DubTrack -Srt $srt -RefAudio $refWav -Duration $dur -OutWav $dubWav -EpisodeName $base
+            # For IndexTTS2, the emotion reference is sliced per-cue and its
+            # acoustics leak into the clone. Prefer the Demucs-isolated vocal
+            # stem (music+reverb removed) over the raw mix when available.
+            $emoRef = $refWav
+            if ($Clone -and $Engine -eq 'indextts' -and $EmotionStemsDir) {
+                # Stem names vary (some carry a ".dubbed" infix, some don't), so try
+                # the exact base, the de-".dubbed" base, then an episode-tag glob.
+                $cands = @("$base.vocals.wav", ($base -replace '\.dubbed$', '') + ".vocals.wav")
+                $cleanVoc = $null
+                foreach ($c in $cands) {
+                    $p = Join-Path $EmotionStemsDir $c
+                    if (Test-Path -LiteralPath $p) { $cleanVoc = $p; break }
+                }
+                if (-not $cleanVoc -and $base -match 'S\d+E\d+') {
+                    $tag = $Matches[0]
+                    $hit = Get-ChildItem -LiteralPath $EmotionStemsDir -Filter "*$tag*vocals.wav" -ErrorAction SilentlyContinue | Select-Object -First 1
+                    if ($hit) { $cleanVoc = $hit.FullName }
+                }
+                if ($cleanVoc) {
+                    Write-Host "  emotion ref: isolated-vocal stem (de-music'd) -> $cleanVoc" -ForegroundColor DarkGray
+                    $emoRef = $cleanVoc
+                }
+                else {
+                    Write-Warning "  emotion ref: no clean vocal stem for '$base' in $EmotionStemsDir; using raw mix (may sound reverby)."
+                }
+            }
+            New-DubTrack -Srt $srt -RefAudio $emoRef -Duration $dur -OutWav $dubWav -EpisodeName $base
             [System.IO.Directory]::CreateDirectory($dubCache) | Out-Null
             [System.IO.File]::Copy($dubWav, $cachedDub, $true)
             Write-Host "  cached dub WAV -> $cachedDub" -ForegroundColor DarkGray
@@ -1023,6 +1079,15 @@ if ($OnlyEpisodes.Count) {
         })
     if ($episodes.Count -eq 0) { throw "No episodes match -OnlyEpisodes: $($OnlyEpisodes -join ', ')" }
     Write-Host "Restricted to $($episodes.Count) episode(s) via -OnlyEpisodes."
+}
+if ($ExcludeEpisodes.Count) {
+    $before = $episodes.Count
+    $episodes = @($episodes | Where-Object {
+            $n = $_.Name
+            ($ExcludeEpisodes | Where-Object { $n -like "*$_*" }).Count -eq 0
+        })
+    Write-Host "Excluded $($before - $episodes.Count) episode(s) via -ExcludeEpisodes: $($ExcludeEpisodes -join ', ')."
+    if ($episodes.Count -eq 0) { throw "-ExcludeEpisodes removed every episode." }
 }
 # optional: rotate so processing starts at -StartFrom and wraps to the front
 # (e.g. -StartFrom 'S01E20' => E20..end, then E01..E19).

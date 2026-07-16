@@ -183,6 +183,10 @@ def main():
                          "delivery, pure neutral clone)")
     ap.add_argument("--no-emotion", action="store_true",
                     help="disable emotion transfer entirely (timbre clone only)")
+    ap.add_argument("--voice-tuning", default=None,
+                    help="JSON of per-speaker + global knobs (emo_alpha, gain_db, "
+                         "temperature, max_text_tokens_per_segment, seed, no_split_under, "
+                         "target_peak). Overrides --emo-alpha per speaker.")
     ap.add_argument("--fallback-speaker-id", type=int, default=None,
                     help="speaker id whose voice covers un-matched cues "
                          "(default: the speaker with the most speech)")
@@ -218,6 +222,39 @@ def main():
         return 4
     by_id = {sp["id"]: sp for sp in speakers}
 
+    # --- tuning knobs (global + per-speaker) --------------------------------
+    tuning = {}
+    if args.voice_tuning and os.path.isfile(args.voice_tuning):
+        with open(args.voice_tuning, encoding="utf-8") as f:
+            tuning = json.load(f)
+        eprint(f"[indextts] loaded voice tuning from {args.voice_tuning}")
+    g = tuning.get("global", {})
+    G_EMO     = float(g.get("emo_alpha", args.emo_alpha))
+    G_TEMP    = float(g.get("temperature", 0.8))
+    G_MAXSEG  = int(g.get("max_text_tokens_per_segment", 120))
+    G_SEED    = int(g.get("seed", 0))
+    G_NOSPLIT = int(g.get("no_split_under", 220))
+    G_PEAK    = float(g.get("target_peak", 0.0))     # 0 = disabled; else true-peak ceiling
+    # Match each dubbed line's loudness to the ORIGINAL line it replaces (measured
+    # from the isolated-vocal stem), preserving the source mix's dynamics/intent
+    # instead of leveling characters against each other.
+    G_MATCH   = bool(g.get("match_source", False))
+    M_FLOOR   = 10.0 ** (float(g.get("match_floor_db",      -38.0)) / 20.0)  # below = treat as no dialogue
+    M_DEFAULT = 10.0 ** (float(g.get("match_default_rms_db",-20.0)) / 20.0)  # fallback level when original is silent
+    M_GMIN    = 10.0 ** (float(g.get("match_min_gain_db",   -12.0)) / 20.0)  # clamp match gain
+    M_GMAX    = 10.0 ** (float(g.get("match_max_gain_db",    12.0)) / 20.0)
+    spk_tune = {int(k): v for k, v in (tuning.get("speakers", {}) or {}).items()}
+    def emo_for(sid):  return float(spk_tune.get(sid, {}).get("emo_alpha", G_EMO))
+    def gain_for(sid): return 10.0 ** (float(spk_tune.get(sid, {}).get("gain_db", 0.0)) / 20.0)
+    if G_SEED:
+        try:
+            import torch
+            _torch = torch
+        except Exception:
+            _torch = None
+    else:
+        _torch = None
+
     # fallback speaker = most speech (speakers are rank-ordered) unless overridden
     fb_id = args.fallback_speaker_id
     if fb_id is None or fb_id not in by_id:
@@ -246,11 +283,18 @@ def main():
             eprint(f"[indextts]   spk{sid:02d} {sp.get('bucket','?'):<14} "
                    f"{n:4d} cue(s)  refs={len(sp['_refs_abs'])}")
 
-    # timbre prompt per speaker: the (longest) reference clip, cached
+    # timbre prompt per speaker: the first reference clip that exists on disk,
+    # falling back to the fallback speaker. The profile's refs[0] is not always
+    # present (some _0.wav clips were pruned), so a blind refs[0] silently
+    # dropped every cue for that speaker (e.g. spk1/Judau). Pick the first file
+    # that is actually on disk instead.
     def timbre_for(sid):
         sp = by_id.get(sid) or by_id[fb_id]
-        refs = sp["_refs_abs"] or by_id[fb_id]["_refs_abs"]
-        return refs[0] if refs else None
+        for refs in (sp["_refs_abs"], by_id[fb_id]["_refs_abs"]):
+            for r in refs:
+                if os.path.isfile(r):
+                    return r
+        return None
 
     # --- load IndexTTS2 -------------------------------------------------------
     try:
@@ -278,17 +322,34 @@ def main():
             eprint(f"[indextts]   cue {i}: no timbre clip for spk{c['speaker']}, "
                    f"skipping")
             continue
+        ce = emo_for(c["speaker"])
         emo = None
-        if not args.no_emotion and args.emo_alpha > 0:
+        if not args.no_emotion and ce > 0:
             emo = emotion_clip(ref, ref_sr, c["start"], c["end"], work, i)
 
+        # loudness of the ORIGINAL line under this cue (from the isolated vocal
+        # stem) -> used to scale the dub so it sits where the original sat.
+        orig_rms = 0.0
+        if G_MATCH:
+            oa = max(0, int(c["start"] * ref_sr)); ob = min(len(ref), int(c["end"] * ref_sr))
+            if ob > oa:
+                seg = ref[oa:ob]
+                orig_rms = float(np.sqrt(np.mean(seg ** 2)))
+
+        # fixed seed per cue: reproducible, and keeps any split pieces consistent
+        # (prevents the voice drifting mid-line)
+        if _torch is not None:
+            _torch.manual_seed(G_SEED + i)
+
         pieces = []
-        for j, part in enumerate(split_long(c["text"])):
+        for j, part in enumerate(split_long(c["text"], limit=G_NOSPLIT)):
             tmp = os.path.join(work, f"cue_{i:04d}_{j}.wav")
             try:
                 tts.infer(spk_audio_prompt=timbre, text=part, output_path=tmp,
-                          emo_audio_prompt=emo, emo_alpha=args.emo_alpha,
-                          verbose=False)
+                          emo_audio_prompt=emo, emo_alpha=ce,
+                          verbose=False,
+                          max_text_tokens_per_segment=G_MAXSEG,
+                          temperature=G_TEMP)
             except Exception as e:
                 eprint(f"[indextts]   cue {i} piece {j} failed: {e}")
                 continue
@@ -306,6 +367,24 @@ def main():
         if not pieces:
             continue
         clip = np.concatenate(pieces) if len(pieces) > 1 else pieces[0]
+
+        # match this line's loudness to the ORIGINAL line it replaces (retains the
+        # source mix's dynamics/intent), rather than leveling characters equally.
+        if G_MATCH and clip.size:
+            cr = float(np.sqrt(np.mean(clip ** 2)))
+            if cr > 1e-6:
+                tgt = orig_rms if orig_rms >= M_FLOOR else M_DEFAULT
+                gm = min(max(tgt / cr, M_GMIN), M_GMAX)
+                clip = clip * gm
+        # optional per-character trim ON TOP of the match (default 0 dB)
+        gl = gain_for(c["speaker"])
+        if gl != 1.0:
+            clip = clip * gl
+        # true-peak ceiling (anti-clip; never flattens dynamics, only caps overs)
+        if G_PEAK > 0.0 and clip.size:
+            pk = float(np.max(np.abs(clip)))
+            if pk > G_PEAK:
+                clip = clip * (G_PEAK / pk)
 
         # fit: compress if the line overruns the gap to the next cue
         if args.fit and i + 1 < n:

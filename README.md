@@ -114,6 +114,105 @@ pwsh ./subtitle-anime-dub-show.ps1 @DubArgs
 
 
 # =============================================================================
+# variant 4 (RECOMMENDED): EXPRESSIVE cloned dub (IndexTTS2)
+# =============================================================================
+# Same two-phase model as variant 3, but Phase B uses IndexTTS2 (-Engine indextts,
+# the default): it clones each character's timbre AND transfers the EMOTION/tone of
+# their original Japanese line (per-cue emo_audio_prompt), guided by the subtitle
+# text. Needs the separate IndexTTS2 venv (install block above) + a Phase A profile.
+# Phase A is identical to variant 3 (Demucs + ECAPA diarization -> global cast +
+# per-episode `turns` in anime-dub-profile.json). Fully local, no audio leaves the
+# box. Quality knobs learned in production (Gundam ZZ, 47 eps):
+#   -EmotionStemsDir   point at the Phase A stem cache
+#                      (<Scratch>\dubprofile-stems_<show>); the emotion reference is
+#                      then the CLEAN Demucs vocal stem, not the raw mix - removes
+#                      the music/reverb bleed that makes clones sound echoey.
+#   -EmoAlpha 0.45     emotion strength; higher bleeds the prompt's ACOUSTICS into
+#                      the clone. Loud/shouty leads distort at >0.35.
+#   -VoiceTuning <json>  per-character + global knobs (see scratchpad/voice_tuning
+#                      .json): per-speaker emo_alpha/gain_db, plus global temperature
+#                      0.5, max_text_tokens_per_segment 400, fixed seed, and
+#                      match_source:true (scale each dubbed line to the RMS of the
+#                      ORIGINAL line it replaces, +/-12 dB clamp - keeps the mix's
+#                      dynamics; whole-track loudnorm stays OFF or it flattens intent).
+#
+# Full show, expressive clone, in place:
+$Idx = "G:\Transcode\index-tts\.venv\Scripts\python.exe"
+$Ck  = "G:\Transcode\index-tts\checkpoints"
+$Stems = "G:\Transcode\dubprofile-stems_Mobile_Suit_Gundam_ZZ"
+$Tune  = "$PSScriptRoot\scratchpad\voice_tuning.json"   # or your own knobs json
+# pwsh ./subtitle-anime-profile.ps1 @DubArgs -Diarizer ecapa       # Phase A (once)
+# pwsh ./subtitle-anime-unique-voices.ps1 @DubArgs `
+#      -Clone -Engine indextts -Redub -Force -All -FitToCues -MusicBed `
+#      -EmoAlpha 0.45 -EmotionStemsDir $Stems -VoiceTuning $Tune `
+#      -IndexTtsPython $Idx -CheckpointsDir $Ck
+
+
+# =============================================================================
+# TARGETING: shows, seasons, movies, and subsets
+# =============================================================================
+# The orchestrators operate on a -Folder and process every VIDEO FILE in it (top
+# level only, non-recursive). Filenames need no SxxExx pattern; -OnlyEpisodes /
+# -ExcludeEpisodes / -StartFrom just substring-match the filename. The Phase A
+# profile (cast + reference clips) is anchored to the folder that holds
+# anime-dub-profile.json - reference-clip paths resolve relative to the PROFILE's
+# own directory, so -CloneProfile can point elsewhere while -Folder differs.
+#
+# --- a whole SHOW (all episodes in one flat folder) --------------------------
+#   pwsh ./subtitle-anime-dub-show.ps1 @DubArgs            # profile all + dub all
+#
+# --- a single SEASON in its own subfolder ------------------------------------
+# Point -Folder at the season dir; the profile/clips/dubs live there too:
+#   $S1 = Join-Path $Show "Season 1"
+#   pwsh ./subtitle-anime-dub-show.ps1 -Folder $S1 -Scratch "G:\Transcode" -Python $V
+# To share ONE show-wide cast across season subfolders instead, profile the whole
+# show once, then dub each season with -CloneProfile pointing at the show profile:
+#   pwsh ./subtitle-anime-unique-voices.ps1 -Folder $S1 -Clone -Engine indextts `
+#        -CloneProfile (Join-Path $Show "anime-dub-profile.json") `
+#        -Redub -Force -All -FitToCues -MusicBed -EmotionStemsDir $Stems -VoiceTuning $Tune `
+#        -IndexTtsPython $Idx -CheckpointsDir $Ck
+#
+# --- a MOVIE (single file) ---------------------------------------------------
+# A movie is just a one-file folder. Profile that one file (its own cast), then dub:
+#   $Movie = "\\10.0.23.105\media\movies\Akira (1988)"     # folder containing the mkv
+#   pwsh ./subtitle-anime-dub-show.ps1 -Folder $Movie -Scratch "G:\Transcode" -Python $V
+# The profile's `turns` are keyed by the movie's filename; multi-voice works from a
+# single file. For a franchise, reuse one profile across movies via -CloneProfile.
+#
+# --- specific episodes / ranges ----------------------------------------------
+#   -OnlyEpisodes "S01E07"                 just one (pilot / re-do a single episode)
+#   -OnlyEpisodes "S01E07","S01E11"        a handful
+#   -ExcludeEpisodes "S01E20","S01E21"     skip already-good ones during a -Force redo
+#   -StartFrom "S01E22"                    process E22..end, then wrap E01..E21
+#   (all of the above take -All; combine with -Redub -Force to rebuild in place.)
+
+
+# =============================================================================
+# RECIPES / gotchas from real runs
+# =============================================================================
+# * UNPROFILED / late-arriving episodes voice as ONE speaker. The IndexTTS2 engine
+#   assigns characters from the profile's per-episode `turns` (keyed by filename);
+#   an episode not present during Phase A has no turns -> every cue uses the
+#   fallback voice. Fix WITHOUT re-clustering the whole cast (which would renumber
+#   speakers and break voice_tuning + clip refs): profile just the new episodes to
+#   a TEMP profile, map each local speaker to the nearest existing-cast centroid
+#   (cosine), and inject their `turns` into the main profile under the mapped
+#   global id. See scratchpad/profile_e03_e12.ps1 + inject_turns.py.
+# * READ-ONLY target folder (e.g. a season subfolder the share won't let you write):
+#   in-place install fails with "Access to the path ... is denied". Copy each source
+#   into a writable sibling (the show's parent folder) and dub there; the profile's
+#   relative clip paths still resolve because they anchor to the profile dir.
+# * DAMAGED source ("remux recovered only N of M s - re-acquire this file"): the
+#   length guard refuses to dub a truncated source. To dub the RECOVERABLE part,
+#   stream-copy remux it first so the container's declared duration matches the
+#   intact content, then dub that (drops the unreadable tail):
+#     ffmpeg -nostdin -y -err_detect ignore_err -i bad.mkv `
+#            -map 0:v:0 -map 0:a:0 -map 0:s:0 -c copy repaired.mkv
+# * ASS/embedded TEXT subtitles are extracted automatically; only IMAGE subs
+#   (PGS/VOBSUB) are skipped (can't be converted to text) - supply a sidecar .srt.
+
+
+# =============================================================================
 # variant 2: unique voice per CHARACTER from a POOL (no cloning)
 # =============================================================================
 # Older approach: fingerprint each line's original speech, track the character
@@ -324,6 +423,37 @@ pwsh ./subtitle-anime.ps1 @DubArgs -All
 #                                             uses %ProgramFiles%\MKVToolNix\
 #                                             mkvmerge.exe when present.
 #   -Verbose           switch    ON           On by default; -Verbose:$false quiets.
+#   --- Phase B cloned engine (variants 3 & 4; requires a Phase A profile) ------
+#   -Clone             switch    off          Use the cloned engine (clone each
+#                                             character's own voice) instead of the
+#                                             pool engine. Needs anime-dub-profile.json.
+#   -Engine            enum      indextts      indextts = IndexTTS2 (timbre + emotion,
+#                                             own venv); xtts = Coqui clone (timbre only).
+#   -CloneProfile      string    <Folder>\anime-dub-profile.json
+#                                             Phase A profile to clone from. Point
+#                                             elsewhere to reuse a show-wide cast when
+#                                             -Folder is a season/subset (clip paths
+#                                             resolve relative to the profile's dir).
+#   -EmoAlpha          double    0.45         IndexTTS2 emotion strength 0..1 (>0.35
+#                                             distorts loud leads; high bleeds acoustics).
+#   -EmotionStemsDir   string    ""           Phase A stem cache; emotion ref = clean
+#                                             Demucs vocal stem, not the raw mix (de-reverb).
+#   -VoiceTuning       string    ""           JSON of per-character + global knobs
+#                                             (emo_alpha/gain_db/temperature/seed/
+#                                             max_text_tokens_per_segment/match_source/
+#                                             loudnorm). See scratchpad/voice_tuning.json.
+#   -MusicBed          switch    off          Lay the dub over a Demucs music+SFX bed
+#                                             (JP dialogue removed) instead of ducking.
+#   -BedVolume         double    0.9          Music+SFX bed level under the dub.
+#   -Redub             switch    off          Strip the existing AI dub track + rebuild.
+#   -Force             switch    off          Bypass the resume-skip (redo this pass).
+#   -OnlyEpisodes      string[]  @()          Process only filenames containing these
+#                                             substrings (e.g. "S01E07").
+#   -ExcludeEpisodes   string[]  @()          Skip filenames containing these.
+#   -StartFrom         string    ""           Rotate order: this episode..end, then wrap.
+#   -IndexTtsPython    string    G:\Transcode\index-tts\.venv\Scripts\python.exe
+#                                             IndexTTS2 venv interpreter (variant 4).
+#   -CheckpointsDir    string    G:\Transcode\index-tts\checkpoints   IndexTTS2 weights.
 #
 # Examples:
 #   # Whole show, defaults, in-place; profile auto-created beside the episodes:
