@@ -1,3 +1,26 @@
+# =============================================================================
+# FOREIGN-LANGUAGE MOVIE BATCH (2026-07) — 10/10 Plex foreign films dubbed
+# =============================================================================
+# Batch-dubbed every foreign-language film in the Plex Movies library and tagged
+# each into a pinned Plex collection "zDUBBED". Full write-up + stats + findings:
+#   FOREIGN-MOVIES-DUB-REPORT.md   (per-title cues/timings, the SMB clip-write fix,
+#                                   diagnosis method, throughput, gotchas)
+# Scripts (scratchpad/, run overnight 23:00-08:00 AU under a 15-min crash monitor):
+#   dub_foreign_movies.ps1  batch runner: tiers, -Stage profile|sample|render|all,
+#                           -OnlyTitles, -IncludeForced/-IncludeSidecar; writes the
+#                           profile+clips to LOCAL disk (dubprofile-local_<key>) to
+#                           dodge the intermittent NAS clip-write LibsndfileError;
+#                           non-destructive -> dubbed\; auto-tags each into zDUBBED.
+#   run_night.ps1           overnight wrapper (list ONLY not-done titles: the runner
+#                           passes -Redub so listed titles are re-dubbed, not skipped)
+#   stop_dub.ps1            kills the launcher tree + workers (the 08:00 cutoff)
+#   movie_voice_tuning.json globals-only IndexTTS2 knobs shared by all movies
+# Plex tools (../../../plex/): plex-audio-language-scan.py (find non-English audio),
+#   plex-dub-collection.py (create/pin zDUBBED at library top, tag dubbed movies).
+# A MOVIE is just a one-file folder (see "TARGETING" below); needs a full English
+# TEXT sub (image/forced subs are skipped -> supply a <base>.en.srt sidecar).
+
+
 # install dependencies
 New-Item -ItemType Directory -Force "G:\Transcode\tmp","G:\Transcode\pip-cache" | Out-Null
 $env:TMP = "G:\Transcode\tmp"; $env:TEMP = "G:\Transcode\tmp"
