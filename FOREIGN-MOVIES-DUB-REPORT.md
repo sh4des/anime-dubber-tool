@@ -61,10 +61,15 @@ fetched via `scratchpad/subs_fetch.py` (subliminal, anonymous providers
 podnapisi/bsplayer/tvsubtitles, hash-matched) with a local Whisper-translate
 fallback (`scratchpad/whisper_subs.py`, faster-whisper large-v3 on the RVA venv).
 subliminal landed 3 (Shin Godzilla 1,791 cues, Shaolin Soccer 995, Cinema Paradiso
-858 — all validated full-dialogue English). The other 6 (Aniara, Godzilla vs.
-Destoroyah, The Wandering Earth, Hell, The Zone of Interest, T-34) go to Whisper
-`task=translate`, scheduled overnight (23:00–08:00 AU) via `run_whisper_night.ps1`
-under a 15-min monitor. Subs only — no dubbing kicked off.
+858 — all validated full-dialogue English). The other 6 went to Whisper
+`task=translate` overnight 2026-07-25, all verified full-dialogue English:
+Aniara 495 cues, The Wandering Earth 1,050, Hell 213 (sparse film, spans 81m),
+The Zone of Interest 568, T-34 748, Godzilla vs. Destoroyah 510 — all written
+beside their sources. Godzilla's folder initially denied SMB writes (was
+`nobody:users` mode 755, no group write); normalized to 775 (owner-authorized)
+and its srt placed + verified. **Net: all 9 previously-blocked films now have a
+full-dialogue English `.en.srt` in place, so all 9 are dubbable.** Subs only —
+no dubbing kicked off.
 
 ---
 
