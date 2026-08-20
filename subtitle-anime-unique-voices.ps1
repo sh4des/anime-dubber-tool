@@ -84,6 +84,14 @@ param(
     # Volume of the music+SFX bed under the dub when -MusicBed (no competing
     # dialogue, so it can sit higher than the -OriginalVolume duck).
     [double]$BedVolume = 0.9,
+    # The bed keeps the ORIGINAL vocal stem everywhere except inside dialogue cues,
+    # so laughs/screams/grunts, breath-like SFX and OP/ED singing survive instead of
+    # being deleted with the whole vocal stem. 1.0 = original level.
+    [double]$BedResidualGain = 1.0,
+    # Extra mute each side of a cue (loose subtitle timing) and the ramp length in
+    # and out of each muted region, both in seconds.
+    [double]$BedDialoguePad = 0.12,
+    [double]$BedFade = 0.03,
 
     # --- persistent character profile (show-level) ---------------------------
     # One JSON per show; recurring characters keep their voice across episodes.
@@ -662,7 +670,7 @@ function New-DubTrack {
 # bleed. Returns the no_vocals WAV path, or $null on failure (caller falls back to
 # ducking the full original). Uses $PYTHON (the venv with demucs installed).
 function Get-MusicBed {
-    param([string]$Video, [int]$StreamRel, [string]$WorkDir)
+    param([string]$Video, [int]$StreamRel, [string]$WorkDir, [string]$Srt)
     $origWav = Join-Path $WorkDir "bed_source.wav"
     $ex = @("-y", "-nostdin", "-v", "error", "-i", $Video, "-map", "0:a:$StreamRel",
             "-ac", "2", "-ar", "44100", "-c:a", "pcm_s16le", $origWav)
@@ -683,11 +691,37 @@ function Get-MusicBed {
         return $null
     }
     Write-Verbose ("  music bed ready in {0:n1}s -> {1}" -f $sw.Elapsed.TotalSeconds, $noVocals)
-    return $noVocals
+
+    # Keep the vocal stem OUTSIDE dialogue cues. no_vocals alone deletes the whole
+    # vocal stem for the entire runtime, which silently loses laughs, screams,
+    # grunts, breath/formant SFX that htdemucs classes as "vocals", and the sung
+    # line of an OP/ED. Demucs already wrote vocals.wav next to no_vocals.wav, so
+    # this costs no extra separation.
+    $vocals = Join-Path $demucsOut "htdemucs\bed_source\vocals.wav"
+    if (-not $Srt -or -not (Test-Path -LiteralPath $Srt)) {
+        Write-Warning "  music bed: no subtitle available; using no_vocals only (non-verbal vocal audio will be lost)"
+        return $noVocals
+    }
+    if (-not (Test-Path -LiteralPath $vocals)) {
+        Write-Warning "  music bed: vocals.wav missing; using no_vocals only (non-verbal vocal audio will be lost)"
+        return $noVocals
+    }
+    $bedMix = Join-Path $WorkDir "bed_with_residual.wav"
+    $builder = Join-Path $PSScriptRoot "build_music_bed.py"
+    & $PYTHON $builder --no-vocals $noVocals --vocals $vocals --srt $Srt --out $bedMix `
+        --pad $BedDialoguePad --fade $BedFade --residual-gain $BedResidualGain 2>&1 |
+        ForEach-Object { Write-Verbose "    $_" }
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $bedMix)) {
+        Write-Warning "  music bed: residual mix failed (exit $LASTEXITCODE); using no_vocals only"
+        return $noVocals
+    }
+    Write-Verbose "  music bed: non-dialogue vocal audio retained -> $bedMix"
+    return $bedMix
 }
 
 function Merge-DubIntoVideo {
-    param([string]$Video, [string]$DubWav, $Probe, [string]$OutVideo, [string]$WorkDir)
+    param([string]$Video, [string]$DubWav, $Probe, [string]$OutVideo, [string]$WorkDir,
+          [string]$Srt)
 
     $audioStreams = @($Probe.streams | Where-Object { $_.codec_type -eq "audio" })
     # Audio-relative indices to KEEP from the source = every audio track that is
@@ -712,7 +746,7 @@ function Merge-DubIntoVideo {
     # -MusicBed, else the full original ducked. Input order: 0=video, 1=dub,
     # and 2=bed WAV only when a Demucs stem was produced.
     $bedWav = $null
-    if ($MusicBed) { $bedWav = Get-MusicBed -Video $Video -StreamRel $firstOrig -WorkDir $WorkDir }
+    if ($MusicBed) { $bedWav = Get-MusicBed -Video $Video -StreamRel $firstOrig -WorkDir $WorkDir -Srt $Srt }
     if ($bedWav) {
         $bedLabel = "[2:a]"; $bedVol = $BedVolume; $extraIn = @("-i", $bedWav)
         $bedDesc = "music+SFX bed@$([int]($BedVolume*100))% (JP dialogue removed)"
@@ -1005,7 +1039,7 @@ function Invoke-Episode {
 
         Write-Host "  [8/8] muxing tracks (local)"
         $localOut = Join-Path $work "$base.dubbed.mkv"
-        Merge-DubIntoVideo -Video $localVideo -DubWav $dubWav -Probe $probe -OutVideo $localOut -WorkDir $work
+        Merge-DubIntoVideo -Video $localVideo -DubWav $dubWav -Probe $probe -OutVideo $localOut -WorkDir $work -Srt $srt
 
         Write-Host "  installing dubbed episode"
         $outFile = Install-DubbedEpisode -LocalOut $localOut -Video $Video -Base $base

@@ -262,10 +262,22 @@ def demucs_vocals(mono_or_path, out_wav, device, verbose=False):
             wav = wav.repeat(2, 1)
         if in_sr != sr:
             wav = torchaudio.functional.resample(wav, in_sr, sr)
+
+        # Leave the mix on the CPU and let Demucs stream segments to the GPU.
+        # apply_model's contract: "When `device` is different from `mix.device`,
+        # only local computations will be on `device`, while the entire tracks
+        # will be stored on `mix.device`." The old code did `wav[None].to(device)`,
+        # which put the WHOLE track plus all 4 full-length stems in VRAM - that is
+        # why films over ~2h thrashed for hours and then died with exit 1 (Colony
+        # 2026 burned 3h45m). Measured on a 3-min clip: peak VRAM 0.58 GB this way
+        # vs multi-GB before, and ~8x faster. Demucs does its own overlap-add, so
+        # this is exact - hand-rolled chunking here produced seam artifacts.
         with torch.no_grad():
-            est = apply_model(model, wav[None].to(device), device=device,
-                              split=True, overlap=0.1)[0]
+            est = apply_model(model, wav[None], device=device,
+                              split=True, overlap=0.1, progress=verbose)[0]
         vocals = est[model.sources.index("vocals")].mean(dim=0, keepdim=True).cpu()
+        del est
+
         torchaudio.save(out_wav, vocals, sr)
         if verbose:
             print(f"[profile]   demucs vocals -> {out_wav}")

@@ -28,6 +28,10 @@ param(
     [string]$IndexTtsPython = "G:\Transcode\index-tts\.venv\Scripts\python.exe",
     [string]$CheckpointsDir = "G:\Transcode\index-tts\checkpoints",
     [string]$VoiceTuning = "",
+    # Explicit profile JSON. Phase A writes profiles to a LOCAL dubprofile-local_*
+    # dir (the SMB clip-write fix), so the default "<Folder>\anime-dub-profile.json"
+    # is not where the movie batch actually puts them - pass this instead.
+    [string]$CloneProfile = "",
     [string]$OutDir = "",
     [string]$Text = "",
     [double]$EmoAlpha = 0.45,
@@ -42,7 +46,7 @@ if (-not $PSBoundParameters.ContainsKey('Verbose')) { $VerbosePreference = 'Cont
 $py = Join-Path $PSScriptRoot "sample_voices_indextts.py"
 if (-not (Test-Path -LiteralPath $py)) { throw "Missing $py" }
 if (-not (Test-Path -LiteralPath $Folder)) { throw "Folder not found: $Folder" }
-$profileJson = Join-Path $Folder "anime-dub-profile.json"
+$profileJson = if ($CloneProfile) { $CloneProfile } else { Join-Path $Folder "anime-dub-profile.json" }
 if (-not (Test-Path -LiteralPath $profileJson)) {
     throw "No Phase A profile at $profileJson. Run subtitle-anime-profile.ps1 first."
 }

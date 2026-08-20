@@ -139,8 +139,12 @@ def main():
     for sp in speakers:
         refs = existing_refs(sp)
         rows.append({
-            "id": sp["id"], "bucket": sp.get("bucket", "?"), "gender": sp.get("gender", "?"),
-            "total_speech_sec": float(sp.get("total_speech_sec", 0.0)),
+            # `or "?"` not .get(default): the profile can carry an explicit null
+            # gender/bucket (pitch-based detection fails for some speakers), and a
+            # null reaches the report's "{...:<8}" width format as None ->
+            # TypeError, killing the report AFTER every voice has been rendered.
+            "id": sp["id"], "bucket": sp.get("bucket") or "?", "gender": sp.get("gender") or "?",
+            "total_speech_sec": float(sp.get("total_speech_sec") or 0.0),
             "n_refs_profile": len(sp.get("references", [])), "n_refs_on_disk": len(refs),
             "emo_alpha": round(emo_for(sp["id"]), 3),
             "timbre": refs[0] if refs else "", "has_timbre": bool(refs),

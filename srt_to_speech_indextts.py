@@ -42,6 +42,8 @@ def eprint(*a):
 
 _TAG = re.compile(r"\{[^}]*\}")          # ASS override tags {\an8} etc.
 _HTML = re.compile(r"<[^>]*>")           # <i> </i>
+_MUSIC_CUE = re.compile(r"[♪♫♬♩]")     # music notes = sung lyric
+_TAG_ONLY_CUE = re.compile(r"^\s*[\[(][^\])]*[\])]\s*$")   # "[laughs]" / "(screams)"
 
 
 def clean_text(s):
@@ -56,9 +58,17 @@ def load_cues(srt_path):
     with open(srt_path, encoding="utf-8", errors="replace") as f:
         subs = list(srt.parse(f.read()))
     cues = []
+    skipped_music = 0
     for s in subs:
         text = clean_text(s.content)
         if not text or not re.search(r"[A-Za-z0-9]", text):
+            continue
+        # Never SPEAK a song lyric or a bare sound tag. Lyric cues would be read
+        # out flatly over the OP/ED, and "[laughs]" would be read literally.
+        # build_music_bed.py applies the same rule, so these regions keep their
+        # ORIGINAL audio (the real singing / the real laugh) instead.
+        if _MUSIC_CUE.search(text) or _TAG_ONLY_CUE.match(text):
+            skipped_music += 1
             continue
         cues.append({"start": s.start.total_seconds(),
                      "end": s.end.total_seconds(), "text": text})
