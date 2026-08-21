@@ -92,6 +92,13 @@ param(
     # and out of each muted region, both in seconds.
     [double]$BedDialoguePad = 0.12,
     [double]$BedFade = 0.03,
+    # ASS style names whose cues must NOT be spoken, comma-separated (e.g.
+    # "OP,OP2,title1,title2"). Some releases mark song lyrics only by STYLE, with
+    # no music note in the text - ffmpeg's srt conversion drops the style, so the
+    # dub would read the theme song aloud AND the bed would mute the real singing.
+    # Marking them keeps the original audio for those cues instead. Leave empty
+    # for the built-in OP/ED/song/karaoke pattern; "none" disables the pass.
+    [string]$NonSpokenStyles = "",
 
     # --- persistent character profile (show-level) ---------------------------
     # One JSON per show; recurring characters keep their voice across episodes.
@@ -245,6 +252,7 @@ $MKVMERGE = $Mkvmerge
 $TTS_SCRIPT      = Join-Path $PSScriptRoot "srt_to_speech_multivoice.py"
 $CLONE_SCRIPT    = Join-Path $PSScriptRoot "srt_to_speech_cloned.py"
 $INDEXTTS_SCRIPT = Join-Path $PSScriptRoot "srt_to_speech_indextts.py"
+$STYLES_SCRIPT   = Join-Path $PSScriptRoot "mark_ass_styles.py"
 
 # ffmpeg log level: 'info' shows what it's doing without the per-frame firehose.
 $FF_LOGLEVEL = "info"
@@ -489,6 +497,7 @@ function Get-SubtitlePlan {
     return [pscustomobject]@{
         Type     = "embedded"
         RelIndex = $relIndex
+        Codec    = $pick.codec_name
         Desc     = "embedded stream #$($pick.index) ($($pick.codec_name))"
     }
 }
@@ -514,6 +523,36 @@ function Export-Subtitle {
     }
     $cueCount = (Select-String -LiteralPath $outSrt -Pattern '^\d+\s*$').Count
     Write-Verbose "  extracted $cueCount subtitle cue(s) to $outSrt"
+
+    # ASS/SSA only: the srt conversion above threw the style away. Re-extract the
+    # raw ASS and mark the styles that must not be spoken, so the dub stays silent
+    # over the OP/ED and build_music_bed keeps the original singing underneath.
+    if ($Plan.Codec -in @("ass", "ssa") -and $NonSpokenStyles -ne "none") {
+        if (-not (Test-Path -LiteralPath $STYLES_SCRIPT)) {
+            Write-Warning "  missing $STYLES_SCRIPT - song lyrics may be spoken over the OP/ED."
+        }
+        else {
+            $outAss = Join-Path $WorkDir "$Base.extracted.ass"
+            $assArgs = @("-y", "-nostdin", "-v", "error", "-i", $ExtractFrom,
+                         "-map", "0:s:$($Plan.RelIndex)", "-c:s", "copy", $outAss)
+            & $FFMPEG @assArgs
+            if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $outAss)) {
+                Write-Warning "  could not re-extract raw ASS; leaving styles unmarked."
+            }
+            else {
+                $mkArgs = @($STYLES_SCRIPT, "--ass", $outAss, "--srt", $outSrt)
+                if ($NonSpokenStyles) { $mkArgs += @("--non-spoken-styles", $NonSpokenStyles) }
+                Write-Cmd $Python $mkArgs
+                # Route the helper's stdout to the host: anything left on the
+                # success stream inside a function becomes part of its RETURN
+                # value, and this function must return the .srt path alone.
+                & $Python @mkArgs 2>&1 | ForEach-Object { Write-Host "  $_" }
+                if ($LASTEXITCODE -ne 0) {
+                    Write-Warning "  style marking failed (exit $LASTEXITCODE); cues left unmarked."
+                }
+            }
+        }
+    }
     return $outSrt
 }
 
