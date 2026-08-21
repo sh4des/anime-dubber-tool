@@ -317,6 +317,35 @@ def _speech_windows(mono, sr, win_s=1.5, hop_s=0.75):
     return out
 
 
+def mute_spans(mono, sr, spans, verbose=False, label=""):
+    """Silence the given (start,end) second ranges in a mono array, in place.
+
+    Used to keep OP/ED singing out of the cast. Demucs puts theme-song vocals in
+    the vocal stem, the diarizer clusters them like any other voice, and because
+    the same song repeats every episode those clusters come out unusually
+    CONSISTENT - so they rank high and look like major recurring characters.
+    Cloning a singer gives a stretched, sing-song delivery. On After War Gundam X
+    this produced 13 phantom characters out of 38.
+
+    Silencing beats filtering afterwards: the VAD then finds nothing there, so no
+    windows, no embeddings, no clusters and no reference clips can come from a
+    song region - one cut point instead of four.
+    """
+    if not spans:
+        return mono, 0.0
+    n = len(mono)
+    muted = 0
+    for a, b in spans:
+        i, j = max(0, int(a * sr)), min(n, int(b * sr))
+        if j > i:
+            mono[i:j] = 0.0
+            muted += (j - i) / sr
+    if verbose and muted:
+        print(f"[profile]   {label}muted {muted:.1f}s of song/non-spoken audio "
+              f"before diarization")
+    return mono, muted
+
+
 def diarize_windows(mono, sr, embed_one, local_threshold, label="", verbose=False):
     """Generic window-embed + cluster diarizer. embed_one(seg_np)->vec|None.
     Returns local speakers: [{"emb", "segments", "dur"}, ...]."""
@@ -486,6 +515,10 @@ def main() -> int:
         description="Build a show voice profile (Phase A) from original audio")
     ap.add_argument("--audio-list", required=True,
                     help="text file, one line per episode: <wav_path>\\t<name>")
+    ap.add_argument("--exclude-spans", default=None,
+                    help="JSON {episode name: [[start_s, end_s], ...]} of ranges "
+                         "to silence before diarization. Keeps OP/ED singing out "
+                         "of the cast; produced by mark_ass_styles.py --emit-spans")
     ap.add_argument("--out", required=True, help="output profile JSON path")
     ap.add_argument("--clip-dir", required=True,
                     help="directory to write reference clip WAVs into")
@@ -632,6 +665,20 @@ def main() -> int:
         return 2
     print(f"[profile] {len(episodes)} episode(s) to profile")
 
+    exclude = {}
+    if args.exclude_spans:
+        try:
+            with open(args.exclude_spans, encoding="utf-8") as f:
+                exclude = json.load(f)
+            tot = sum(sum(b - a for a, b in v) for v in exclude.values())
+            print(f"[profile] exclusions: {len(exclude)} episode(s), "
+                  f"{tot/60:.1f} min of song/non-spoken audio will be silenced "
+                  f"before diarization")
+        except (OSError, ValueError) as e:
+            print(f"[profile] WARNING: could not read --exclude-spans "
+                  f"({e}); proceeding without exclusions", file=sys.stderr)
+            exclude = {}
+
     # Build the window-embedding function for the chosen local backend. pyannote
     # is self-contained (no embed_one needed).
     embed_one = None
@@ -689,6 +736,10 @@ def main() -> int:
         src_wav = used or wav_path
 
         mono = load_audio(src_wav, TARGET_SR)
+        ep_spans = exclude.get(name) or []
+        if ep_spans:
+            mono, _ = mute_spans(mono, TARGET_SR, ep_spans,
+                                 verbose=args.verbose, label="")
         # persist the (mono, TARGET_SR) we diarized on, for later clip slicing
         stem_wav = os.path.join(scratch, f"{name}.mono16k.wav")
         save_clip(mono, TARGET_SR, stem_wav, sr_out=TARGET_SR)
@@ -704,6 +755,23 @@ def main() -> int:
                       file=sys.stderr)
                 return 4
             backends_used.add("pyannote")
+            # pyannote diarizes the FILE, not the muted `mono`, so the silencing
+            # above cannot reach it - drop the song segments from its output and
+            # discard any speaker left with nothing.
+            if ep_spans:
+                kept = []
+                for ls in locals_:
+                    segs = [(a, b) for a, b in ls["segments"]
+                            if not any(min(b, e) - max(a, s) > 0.5 * (b - a)
+                                       for s, e in ep_spans)]
+                    if segs:
+                        ls["segments"] = segs
+                        ls["dur"] = sum(b - a for a, b in segs)
+                        kept.append(ls)
+                if args.verbose and len(kept) != len(locals_):
+                    print(f"[profile]   dropped {len(locals_) - len(kept)} "
+                          f"song-only pyannote speaker(s)")
+                locals_ = kept
         else:
             locals_ = diarize_windows(mono, TARGET_SR, embed_one,
                                       args.local_threshold, label=backend,

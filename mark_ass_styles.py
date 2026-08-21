@@ -44,6 +44,17 @@ _DRAW = re.compile(r"\\p[1-9]")                  # vector drawing blocks, never 
 DEFAULT_NON_SPOKEN = r"^(op|ed|opening|ending|song|insert|lyric|lyrics|karaoke|kara)\d*$"
 
 
+def merge_spans(spans, gap=0.5):
+    """Sort and coalesce (start,end) pairs closer together than `gap` seconds."""
+    out = []
+    for a, b in sorted(spans):
+        if out and a - out[-1][1] <= gap:
+            out[-1][1] = max(out[-1][1], b)
+        else:
+            out.append([a, b])
+    return [[round(a, 3), round(b, 3)] for a, b in out]
+
+
 def norm(s: str) -> str:
     """Comparable form of a cue's text: tags gone, whitespace collapsed."""
     s = _ASS_TAG.sub("", s or "")
@@ -115,8 +126,20 @@ def read_srt(path):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ass", required=True)
-    ap.add_argument("--srt", required=True)
+    ap.add_argument("--srt", default=None,
+                    help="srt to mark; omit when only --emit-spans is wanted")
     ap.add_argument("--out", default=None, help="default: rewrite --srt in place")
+    ap.add_argument("--emit-spans", default=None,
+                    help="also write the non-spoken (start,end) spans as JSON. "
+                         "Phase A uses these to keep OP/ED singing out of the "
+                         "cast - see profile_show.py --exclude-spans.")
+    ap.add_argument("--span-pad", type=float, default=0.25,
+                    help="seconds added each side of an emitted span. Song cues "
+                         "are timed to the lyric, not to the note, so a little "
+                         "sung audio sits outside them; without the pad that "
+                         "residue survives as a thin 'speaker'. Measured on "
+                         "Gundam X: 0.25 removed 2 more phantom singers and cost "
+                         "no real character, and larger pads gained nothing.")
     ap.add_argument("--non-spoken-styles", default="",
                     help="comma-separated ASS style names; empty = built-in "
                          "song/lyric pattern")
@@ -138,7 +161,7 @@ def main():
 
     try:
         ass = read_ass(args.ass)
-        blocks = read_srt(args.srt)
+        blocks = read_srt(args.srt) if args.srt else []
     except OSError as e:
         print(f"[styles] FATAL: {e}", file=sys.stderr)
         return 2
@@ -148,6 +171,20 @@ def main():
     hit_styles = sorted({a[2] for a in targets})
     print(f"[styles] ASS styles present: {', '.join(styles_seen) or '(none)'}")
     print(f"[styles] non-spoken rule: {shown} -> matches {', '.join(hit_styles) or '(none)'}")
+
+    if args.emit_spans:
+        import json
+        p = max(0.0, args.span_pad)
+        spans = merge_spans([(max(0.0, a[0] / 1000.0 - p), a[1] / 1000.0 + p)
+                             for a in targets])
+        with open(args.emit_spans, "w", encoding="utf-8") as f:
+            json.dump(spans, f)
+        total = sum(b - a for a, b in spans)
+        print(f"[styles] {len(spans)} non-spoken span(s), {total:.1f}s "
+              f"-> {args.emit_spans}")
+
+    if not args.srt:
+        return 0
 
     if not targets:
         print("[styles] nothing to mark; SRT left unchanged")

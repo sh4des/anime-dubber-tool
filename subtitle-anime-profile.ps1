@@ -65,6 +65,15 @@ param(
     [double]$ClusterThreshold,
     [double]$LocalThreshold,
 
+    # Keep OP/ED singing OUT of the cast. Theme-song vocals land in the Demucs
+    # vocal stem and cluster like any other voice - and because the same song
+    # repeats every episode those clusters are unusually consistent, so they rank
+    # high and look like major characters. Their clones sound stretched and
+    # sing-song. Song regions are read from the ASS styles and silenced before
+    # diarization. Comma-separated style names; empty = built-in OP/ED/song
+    # pattern; "none" disables the pass.
+    [string]$NonSpokenStyles = "",
+
     [string]$Python = "python"
 )
 
@@ -83,6 +92,7 @@ if (-not $PSBoundParameters.ContainsKey('Python')) {
     if (Test-Path -LiteralPath $venvPy) { $Python = $venvPy }
 }
 $PROFILE_SCRIPT = Join-Path $PSScriptRoot "profile_show.py"
+$STYLES_SCRIPT  = Join-Path $PSScriptRoot "mark_ass_styles.py"
 $FF_LOGLEVEL = "info"
 
 if (-not $Out)     { $Out     = Join-Path $Folder "anime-dub-profile.json" }
@@ -153,6 +163,7 @@ $listFile = Join-Path $work "audio-list.tsv"
 try {
     # --- extract one original-audio WAV per episode --------------------------
     $lines = New-Object System.Collections.Generic.List[string]
+    $spanMap = @{}
     $n = 0
     foreach ($ep in $episodes) {
         $n++
@@ -177,9 +188,39 @@ try {
             Write-Warning ("  audio truncated ({0:n0}s of {1:n0}s) - if this show hit the EBML demux bug, remux it first (see subtitle-anime-unique-voices.ps1 Repair-Container)." -f $wavDur, $srcDur)
         }
         $lines.Add("$wav`t$base")
+
+        # Song / non-spoken spans from the ASS styles, so profile_show.py can
+        # silence them before diarization and they never become "characters".
+        if ($NonSpokenStyles -ne "none" -and (Test-Path -LiteralPath $STYLES_SCRIPT)) {
+            $epAss = Join-Path $work "$base.ass"
+            & $FFMPEG -y -nostdin -v error -i $ep.FullName -map "0:s:0" -c:s copy $epAss 2>$null
+            if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $epAss)) {
+                $epSpans = Join-Path $work "$base.spans.json"
+                $sArgs = @($STYLES_SCRIPT, "--ass", $epAss, "--emit-spans", $epSpans)
+                if ($NonSpokenStyles) { $sArgs += @("--non-spoken-styles", $NonSpokenStyles) }
+                & $Python @sArgs 2>&1 | ForEach-Object { Write-Verbose "  $_" }
+                if (Test-Path -LiteralPath $epSpans) {
+                    $spanMap[$base] = (Get-Content -LiteralPath $epSpans -Raw | ConvertFrom-Json)
+                }
+            }
+            Remove-Item -LiteralPath $epAss -ErrorAction SilentlyContinue
+        }
     }
     if ($lines.Count -eq 0) { throw "No audio extracted from any episode." }
     Set-Content -LiteralPath $listFile -Value $lines -Encoding UTF8
+
+    $spansFile = ""
+    if ($spanMap.Count -gt 0) {
+        $spansFile = Join-Path $work "exclude-spans.json"
+        ($spanMap | ConvertTo-Json -Depth 5 -Compress) |
+            Set-Content -LiteralPath $spansFile -Encoding UTF8
+        $totSec = 0.0
+        foreach ($v in $spanMap.Values) { foreach ($s in $v) { $totSec += ($s[1] - $s[0]) } }
+        Write-Host ("Song/non-spoken exclusions: {0} episode(s), {1:n1} min will be silenced before diarization." -f $spanMap.Count, ($totSec / 60))
+    }
+    elseif ($NonSpokenStyles -ne "none") {
+        Write-Host "No ASS song styles found - profiling the full audio (OP/ED singing may cluster as characters)."
+    }
 
     # --- run the profiler ----------------------------------------------------
     $pyArgs = @(
@@ -195,6 +236,7 @@ try {
     # Only override thresholds when the user set them; else per-backend defaults.
     if ($PSBoundParameters.ContainsKey('ClusterThreshold')) { $pyArgs += @("--cluster-threshold", $ClusterThreshold) }
     if ($PSBoundParameters.ContainsKey('LocalThreshold'))   { $pyArgs += @("--local-threshold", $LocalThreshold) }
+    if ($spansFile)  { $pyArgs += @("--exclude-spans", $spansFile) }
     if ($NoDemucs)   { $pyArgs += "--no-demucs" }
     if ($ReuseStems) { $pyArgs += "--reuse-stems" }
     if ($HfToken)    { $pyArgs += @("--hf-token", $HfToken) }
