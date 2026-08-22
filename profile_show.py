@@ -400,15 +400,20 @@ def make_ecapa_embed(device, sr):
     try:
         import torch
         from speechbrain.inference.speaker import EncoderClassifier
+        from speechbrain.utils.fetching import LocalStrategy
     except Exception as e:
         print(f"[profile] ECAPA unavailable ({e}); install:  pip install speechbrain",
               file=sys.stderr)
         return None
     savedir = os.path.join(os.environ.get("HF_HOME", os.path.expanduser("~/.cache")),
                            "speechbrain-ecapa")
+    # COPY, not the SYMLINK default: on Windows symlinking needs elevation or
+    # Developer Mode, and without it the fetch dies with WinError 1314 before a
+    # single episode is profiled.
     clf = EncoderClassifier.from_hparams(
         source="speechbrain/spkrec-ecapa-voxceleb",
-        run_opts={"device": device}, savedir=savedir)
+        run_opts={"device": device}, savedir=savedir,
+        local_strategy=LocalStrategy.COPY)
 
     def embed_one(seg):
         try:
