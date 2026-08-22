@@ -41,7 +41,12 @@ _DRAW = re.compile(r"\\p[1-9]")                  # vector drawing blocks, never 
 
 # Styles treated as non-spoken when --non-spoken-styles is not given. Covers the
 # usual naming for opening/ending themes, insert songs and karaoke layers.
-DEFAULT_NON_SPOKEN = r"^(op|ed|opening|ending|song|insert|lyric|lyrics|karaoke|kara)\d*$"
+# Matches the song-style names releases actually use. Anchored at the START with
+# a word boundary after, so qualified names still hit ("Lyrics Top", "OP Romaji",
+# "ED-2") while ordinary dialogue styles do not ("Subtitle", "Caption-2", and
+# "Editor", where the \b stops `ed` from matching).
+DEFAULT_NON_SPOKEN = (r"^(op|ed|opening|ending|song|insert|lyrics|lyric|karaoke"
+                      r"|kara)[\s._-]*\d*\b")
 
 
 def merge_spans(spans, gap=0.5):

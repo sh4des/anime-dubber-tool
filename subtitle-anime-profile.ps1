@@ -192,9 +192,20 @@ try {
         # Song / non-spoken spans from the ASS styles, so profile_show.py can
         # silence them before diarization and they never become "characters".
         if ($NonSpokenStyles -ne "none" -and (Test-Path -LiteralPath $STYLES_SCRIPT)) {
+            # Pick the ASS/SSA stream by its SUBTITLE-RELATIVE index - it is not
+            # always s:0. A BD rip often carries image subs first (Ideon: PGS at
+            # s:0, ASS at s:1), and muxing PGS into .ass just fails.
+            $subStreams = @(& $FFPROBE -v error -select_streams s `
+                -show_entries stream=codec_name -of csv=p=0 -- $ep.FullName)
+            $assRel = -1
+            for ($k = 0; $k -lt $subStreams.Count; $k++) {
+                if ($subStreams[$k] -match '^(ass|ssa)') { $assRel = $k; break }
+            }
             $epAss = Join-Path $work "$base.ass"
-            & $FFMPEG -y -nostdin -v error -i $ep.FullName -map "0:s:0" -c:s copy $epAss 2>$null
-            if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $epAss)) {
+            if ($assRel -ge 0) {
+                & $FFMPEG -y -nostdin -v error -i $ep.FullName -map "0:s:$assRel" -c:s copy $epAss 2>$null
+            }
+            if ($assRel -ge 0 -and $LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $epAss)) {
                 $epSpans = Join-Path $work "$base.spans.json"
                 $sArgs = @($STYLES_SCRIPT, "--ass", $epAss, "--emit-spans", $epSpans)
                 if ($NonSpokenStyles) { $sArgs += @("--non-spoken-styles", $NonSpokenStyles) }
