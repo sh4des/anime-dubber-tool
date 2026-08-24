@@ -52,6 +52,14 @@ import sys
 
 os.environ.setdefault("COQUI_TOS_AGREED", "1")
 
+# speechbrain copies its checkpoints with symlinks; on Windows that needs developer
+# mode or admin, else it dies with WinError 1314. scratchpad/run_cast_queue.ps1 sets
+# these, but the script must stand on its own when invoked directly. (The speechbrain
+# fetch below also passes LocalStrategy.COPY; this covers huggingface_hub downloads
+# more broadly, e.g. the pyannote models.)
+os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS", "1")
+os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+
 # Reuse the shared age+gender model + helpers from the multi-voice script (its
 # heavy imports live inside methods, so importing the module is cheap).
 try:
