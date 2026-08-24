@@ -1,0 +1,86 @@
+{
+ "_doc": "Per-movie IndexTTS2 tuning for Gagarin_-_First_in_Space__2013_, generated from its voice audition report. CLIPPED -> emo_alpha 0.30, HOT -> 0.35; the rest inherit the global 0.45. Regenerate with make_tuning.py after re-auditioning.",
+ "global": {
+  "emo_alpha": 0.45,
+  "temperature": 0.5,
+  "max_text_tokens_per_segment": 400,
+  "seed": 12345,
+  "no_split_under": 320,
+  "target_peak": 0.97,
+  "match_source": true,
+  "match_default_rms_db": -20.0,
+  "match_max_gain_db": 12.0,
+  "loudnorm": false
+ },
+ "speakers": {
+  "1": {
+   "emo_alpha": 0.3
+  },
+  "8": {
+   "emo_alpha": 0.3
+  },
+  "17": {
+   "emo_alpha": 0.3
+  },
+  "22": {
+   "emo_alpha": 0.3
+  },
+  "25": {
+   "emo_alpha": 0.3
+  },
+  "33": {
+   "emo_alpha": 0.3
+  },
+  "38": {
+   "emo_alpha": 0.3
+  },
+  "3": {
+   "emo_alpha": 0.35
+  },
+  "4": {
+   "emo_alpha": 0.35
+  },
+  "5": {
+   "emo_alpha": 0.35
+  },
+  "6": {
+   "emo_alpha": 0.35
+  },
+  "9": {
+   "emo_alpha": 0.35
+  },
+  "12": {
+   "emo_alpha": 0.35
+  },
+  "15": {
+   "emo_alpha": 0.35
+  },
+  "16": {
+   "emo_alpha": 0.35
+  },
+  "19": {
+   "emo_alpha": 0.35
+  },
+  "24": {
+   "emo_alpha": 0.35
+  },
+  "27": {
+   "emo_alpha": 0.35
+  },
+  "29": {
+   "emo_alpha": 0.35
+  },
+  "30": {
+   "emo_alpha": 0.35
+  },
+  "32": {
+   "emo_alpha": 0.35
+  },
+  "39": {
+   "emo_alpha": 0.35
+  },
+  "40": {
+   "emo_alpha": 0.35
+  }
+ }
+}

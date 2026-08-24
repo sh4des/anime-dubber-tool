@@ -1,0 +1,20 @@
+{
+ "_doc": "Per-movie IndexTTS2 tuning for Hell__2011_, generated from its voice audition report. CLIPPED -> emo_alpha 0.30, HOT -> 0.35; the rest inherit the global 0.45. Regenerate with make_tuning.py after re-auditioning.",
+ "global": {
+  "emo_alpha": 0.45,
+  "temperature": 0.5,
+  "max_text_tokens_per_segment": 400,
+  "seed": 12345,
+  "no_split_under": 320,
+  "target_peak": 0.97,
+  "match_source": true,
+  "match_default_rms_db": -20.0,
+  "match_max_gain_db": 12.0,
+  "loudnorm": false
+ },
+ "speakers": {
+  "13": {
+   "emo_alpha": 0.3
+  }
+ }
+}

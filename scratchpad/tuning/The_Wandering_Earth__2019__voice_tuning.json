@@ -1,0 +1,56 @@
+{
+ "_doc": "Per-movie IndexTTS2 tuning for The_Wandering_Earth__2019_, generated from its voice audition report. CLIPPED -> emo_alpha 0.30, HOT -> 0.35; the rest inherit the global 0.45. Regenerate with make_tuning.py after re-auditioning.",
+ "global": {
+  "emo_alpha": 0.45,
+  "temperature": 0.5,
+  "max_text_tokens_per_segment": 400,
+  "seed": 12345,
+  "no_split_under": 320,
+  "target_peak": 0.97,
+  "match_source": true,
+  "match_default_rms_db": -20.0,
+  "match_max_gain_db": 12.0,
+  "loudnorm": false
+ },
+ "speakers": {
+  "1": {
+   "emo_alpha": 0.3
+  },
+  "18": {
+   "emo_alpha": 0.3
+  },
+  "19": {
+   "emo_alpha": 0.3
+  },
+  "29": {
+   "emo_alpha": 0.3
+  },
+  "37": {
+   "emo_alpha": 0.3
+  },
+  "2": {
+   "emo_alpha": 0.35
+  },
+  "6": {
+   "emo_alpha": 0.35
+  },
+  "9": {
+   "emo_alpha": 0.35
+  },
+  "17": {
+   "emo_alpha": 0.35
+  },
+  "21": {
+   "emo_alpha": 0.35
+  },
+  "25": {
+   "emo_alpha": 0.35
+  },
+  "31": {
+   "emo_alpha": 0.35
+  },
+  "35": {
+   "emo_alpha": 0.35
+  }
+ }
+}
