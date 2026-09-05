@@ -11,6 +11,10 @@ overnight 2026-07-24 and verified on disk: Roma 2,509 MB, Apocalypto 10,595 MB
 `-DUBBED.mkv` in their source folders. Verified by checking the actual output FILE,
 not the tag/log.)
 
+**Since then: Solaris (1972) dubbed 2026-09-04 → 12 in `zDUBBED`.** It was the first
+feature-length foreign film run after this batch and broke the pipeline in five
+distinct ways; see the [addendum](#addendum--solaris-1972-dubbed-2026-09-04).
+
 ---
 
 ## Discovery (how the shortlist was found)
@@ -31,11 +35,15 @@ forced/image-sub-only or not requested).
 
 ---
 
-## The 10 dubbed films
+## The dubbed films (12)
 
-Dubs are written **non-destructively** to `<movie>\dubbed\<name>.dubbed.mkv` beside
+Dubs are rendered **non-destructively** to `<movie>\dubbed\<name>.dubbed.mkv` beside
 each source (originals untouched); the English AI track is set default, original
-audio + subs preserved.
+audio + subs preserved. They are then filed as `<base>-DUBBED.mkv` **in the movie
+folder itself**, keeping the original's `{edition-...}` token — that is what makes
+Plex read the dub as a second *version* of the same title. Do not give it a
+different edition token: Plex's Editions feature then splits it into a separate
+library item, which shows up as a false duplicate to the `plexdup` job.
 
 | # | Film | Orig lang | Cues | Notes |
 |---|------|-----------|-----:|-------|
@@ -50,6 +58,7 @@ audio + subs preserved.
 | 9 | Apocalypto (2006) | myn (Mayan) | 447 | re-rendered 2026-07-24 (first tag was empty); 10,595 MB, verified |
 | 10 | Godzilla Minus One (2023) | ja | 1060 | 2160p TrueHD Atmos remux; the outlier — ~3 h Phase A, 67 GB source-copy-local + 71 GB result-copy-to-NAS |
 | + | The Beast (2024) | fr | 847 | done in an earlier session (validation title) |
+| 12 | Solaris (1972) | ru | 1098 | added 2026-09-04, well after this batch — see below |
 
 Deferred/skipped (not dubbed): 3 forced-sub-only titles (Aniara, Godzilla vs.
 Destoroyah, The Wandering Earth) and 6 with no usable English text sub (Shin
@@ -107,9 +116,12 @@ un-batched CUDA work. The reliable tells:
 - **`-Redub` re-does listed titles** — the runner does NOT skip already-dubbed movies
   when they're passed explicitly, so the nightly title list must be pruned to
   not-done titles each night or it wastes hours re-dubbing completed ones.
-- **MusicBed Demucs OOMs on 2 h+ films** (`enforce fail at alloc_cpu.cpp`) → the
+- ~~**MusicBed Demucs OOMs on 2 h+ films** (`enforce fail at alloc_cpu.cpp`) → the
   pipeline gracefully falls back to "ducked original" (dub @100 % over original
-  @60 %). Acceptable degradation, not a failure.
+  @60 %). Acceptable degradation, not a failure.~~ **Superseded 2026-09-04:** this
+  was not acceptable degradation — the same OOM also hits *Phase A*, where the
+  fallback is un-separated audio and a visibly wrong cast. Fixed by
+  `demucs_chunked.py`; see the Solaris addendum below.
 - **Start-Process arg-quoting** splits titles with spaces → launch via a wrapper
   `.ps1` with `-OnlyTitles @(...)` instead of passing the array through the CLI.
 - **Cached embeddings** (`locals_cache.pkl` in the stem dir) make a failed title's
@@ -136,3 +148,47 @@ Render ≈ **10–13 cues/min**. A dense/long film ≈ 2–3 h Phase A + 1–2.5
 | `scratchpad/movie_voice_tuning.json` | globals-only IndexTTS2 knobs for movies |
 | `plex/plex-audio-language-scan.py` | scan library for non-English audio |
 | `plex/plex-dub-collection.py` | create/pin `zDUBBED`, tag dubbed movies |
+
+---
+
+## Addendum — Solaris (1972), dubbed 2026-09-04
+
+Added to the library long after the batch above, and the first **feature-length**
+foreign film run since. Its length and its subtitle between them exposed five real
+bugs, all now fixed in this repo. Worth reading before the next long film.
+
+2:46:55, 1098 cues, HEVC 1080p. Audio `a:0` **Italian AC3 5.1 (flagged default)**,
+`a:1` Russian AC3 1.0 — the original. Full "ENG Full" subrip embedded at `s:2`.
+Phase A found 19 speakers / 41 reference clips; Phase B ran 100 min at ~11 cues/min.
+
+1. **`-RefAudioIndex` was not reachable from the wrapper.** Both phase scripts took
+   it; `subtitle-anime-dub-show.ps1` did not pass it through, so a foreign film that
+   ships a dub as `a:0` could only be cloned from that dub. Now plumbed through to
+   both phases *and* to the `-MusicBed` source, which previously always used the
+   first kept audio stream regardless.
+2. **A cue-less episode crashed Phase A.** Zero non-spoken spans serialise as
+   `null` from PowerShell's `ConvertTo-Json`, and `profile_show.py` iterated it →
+   `TypeError`, dead run.
+3. **Demucs could not separate a film-length track.** `apply_model` returns every
+   stem at full length in *host* RAM — 0.68 GB for a 22-min episode but **14.1 GB**
+   for 2h47m, as one contiguous block. New `demucs_chunked.py` streams 8-min windows
+   to disk with a 2 s crossfade: sample-exact, corr 0.995 vs whole-file, ~47x
+   realtime. **The old failure was silent** — the profiler fell back to un-separated
+   audio and produced 14 speakers with the lead at 1879 s of "speech"; with real
+   stems, 19 speakers and the lead at 638 s. Music and ambience were clustering as
+   characters. If a long film's cast looks lumpy, check stderr before trusting QC.
+4. **The emotion reference was held whole in RAM** (1.77 GB for this film) on top of
+   the IndexTTS2 weights, which exhausted the Windows commit limit and killed the
+   render on a *920 KiB* numpy allocation at cue 10. Now read per-cue from disk.
+5. **Two cues were silently dropped.** Python's stdout falls back to cp1252 when
+   redirected, so any text outside it kills the engine's own logging inside the
+   per-cue `try/except` — and that cue never reaches the dub. This film's English sub
+   is an OCR job seeded with Cyrillic homoglyphs: `"I соuIdn't see the sun"` (Cyrillic
+   s and o, plus a capital `I` standing in for `l`) and `"FOR К. KELVIN"` (Cyrillic
+   Ka). Fixed by forcing UTF-8 **and** folding the look-alikes back to Latin, so the
+   lines are pronounced rather than merely rendered. The folding only fires when a
+   line is otherwise Latin and every Cyrillic character is a known confusable, so
+   genuine foreign text is untouched — it changed exactly 2 of 1098 cues here.
+
+Re-rendered after the fixes: 1098/1098 cues, zero failures. The two recovered lines
+measure −21.8 dB and −23.3 dB where the first render had −81.9 dB and −57.1 dB.

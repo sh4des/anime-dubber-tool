@@ -46,11 +46,47 @@ _MUSIC_CUE = re.compile(r"[♪♫♬♩]")     # music notes = sung lyric
 _TAG_ONLY_CUE = re.compile(r"^\s*[\[(][^\])]*[\])]\s*$")   # "[laughs]" / "(screams)"
 
 
+# Cyrillic characters that are visually identical to a Latin one. OCR'd subs
+# for foreign films are riddled with them: Solaris (1972)'s English track has
+# "I соuIdn't see the sun" (Cyrillic s and o) and "FOR К. KELVIN" (Cyrillic Ka).
+# They look right on screen but reach the TTS as Russian letters, so the line is
+# either mispronounced or mangled by the phonemiser.
+_CONFUSABLES = str.maketrans({
+    "А": "A", "В": "B", "Е": "E", "К": "K", "М": "M", "Н": "H", "О": "O",
+    "Р": "P", "С": "C", "Т": "T", "У": "Y", "Х": "X", "Ѕ": "S", "І": "I",
+    "Ј": "J", "Ԁ": "D", "Ԍ": "G",
+    "а": "a", "е": "e", "о": "o", "р": "p", "с": "c", "у": "y", "х": "x",
+    "ѕ": "s", "і": "i", "ј": "j", "ԁ": "d", "ѵ": "v", "ѡ": "w",
+})
+_CYRILLIC = re.compile(r"[Ѐ-ӿ]")
+_LATIN = re.compile(r"[A-Za-z]")
+# The same OCR pass also swaps lowercase l for capital I ("I couIdn't see the
+# sun"). Only fold when BOTH neighbours are lowercase, which leaves the word
+# "I", "I'm" and "AI" alone but catches it mid-word.
+_CAP_I_FOR_L = re.compile(r"(?<=[a-z])I(?=[a-z])")
+
+
+def deconfuse(s):
+    """Fold Cyrillic look-alikes back to Latin in otherwise-Latin text.
+
+    Only fires when the line already contains Latin letters AND every Cyrillic
+    character in it is a known look-alike - the signature of OCR noise. A
+    genuinely Russian line (or one with any non-confusable Cyrillic, e.g. "П")
+    is left completely alone, so real foreign text is never corrupted.
+    """
+    s = _CAP_I_FOR_L.sub("l", s)
+    if not _CYRILLIC.search(s) or not _LATIN.search(s):
+        return s
+    if any(ord(ch) not in _CONFUSABLES for ch in s if _CYRILLIC.match(ch)):
+        return s
+    return s.translate(_CONFUSABLES)
+
+
 def clean_text(s):
     s = _TAG.sub("", s)
     s = _HTML.sub("", s)
     s = s.replace("\\N", " ").replace("\\n", " ")
-    return " ".join(s.split()).strip()
+    return deconfuse(" ".join(s.split()).strip())
 
 
 def load_cues(srt_path):
@@ -147,12 +183,48 @@ def match_cue(cue, turns):
 
 # --- emotion reference slicing ------------------------------------------------
 
+class LazyRefAudio:
+    """The emotion reference, read from disk one cue-slice at a time.
+
+    Only `len()` and `[a:b]` are ever used on it, so this is a drop-in for the
+    numpy array this used to be - and it keeps the footprint independent of
+    runtime. Reading it whole costs 1.77 GB for a 2h47m mono 44.1 kHz stem as
+    float32 (the isolated vocal stem from Phase A), on top of the IndexTTS2
+    weights. On Solaris (1972) that was enough to exhaust the Windows commit
+    limit and abort the render on a *920 KiB* numpy allocation at cue ~10 -
+    a failure that looks nothing like "out of memory" in the log.
+    """
+
+    def __init__(self, path):
+        import soundfile as sf
+        self._sf = sf
+        self.path = path
+        info = sf.info(path)
+        self.samplerate = info.samplerate
+        self._frames = int(info.frames)
+
+    def __len__(self):
+        return self._frames
+
+    def __getitem__(self, key):
+        import numpy as np
+        if not isinstance(key, slice):
+            raise TypeError("LazyRefAudio supports slicing only")
+        a, b, step = key.indices(self._frames)
+        if step != 1:
+            raise ValueError("LazyRefAudio supports contiguous slices only")
+        if b <= a:
+            return np.zeros(0, dtype="float32")
+        y, _ = self._sf.read(self.path, start=a, stop=b, dtype="float32",
+                             always_2d=False)
+        if y.ndim > 1:
+            y = y.mean(axis=1)
+        return y
+
+
 def load_ref_audio(path):
-    import soundfile as sf
-    y, sr = sf.read(path, dtype="float32", always_2d=False)
-    if y.ndim > 1:
-        y = y.mean(axis=1)
-    return y, sr
+    ref = LazyRefAudio(path)
+    return ref, ref.samplerate
 
 
 def emotion_clip(ref, sr, start, end, work, idx):

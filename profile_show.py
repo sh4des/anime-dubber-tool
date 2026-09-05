@@ -261,6 +261,24 @@ def demucs_vocals(mono_or_path, out_wav, device, verbose=False):
         print(f"[profile] Demucs unavailable ({e}); using un-separated audio.",
               file=sys.stderr)
         return None
+    # Long inputs first. The whole-file call below allocates every stem at full
+    # length in HOST RAM - 14.1 GB for a 2h47m film - and that single contiguous
+    # allocation fails outright, after which this function returns None and the
+    # profile is silently built from un-separated audio. demucs_chunked streams
+    # bounded windows to disk instead. It returns None only when the input is not
+    # already at the model's rate, in which case fall through.
+    try:
+        from demucs_chunked import separate_to_files
+        if separate_to_files(mono_or_path, {"vocals": out_wav}, device=str(device),
+                             model_name=DEMUCS_MODEL, mono=True,
+                             log=(print if verbose else (lambda _m: None))):
+            if verbose:
+                print(f"[profile]   demucs vocals (chunked) -> {out_wav}")
+            return out_wav
+    except Exception as e:
+        print(f"[profile] chunked Demucs failed ({e}); trying whole-file.",
+              file=sys.stderr)
+
     try:
         model = get_model(DEMUCS_MODEL)
         model.to(device).eval()
@@ -683,7 +701,10 @@ def main() -> int:
         try:
             with open(args.exclude_spans, encoding="utf-8") as f:
                 exclude = json.load(f)
-            tot = sum(sum(b - a for a, b in v) for v in exclude.values())
+            # `or []`: an episode with no spans can arrive as null (PowerShell's
+            # ConvertTo-Json renders an empty array that way). Line ~752 already
+            # tolerates it; this sum used to raise TypeError and kill the run.
+            tot = sum(sum(b - a for a, b in v or []) for v in exclude.values())
             print(f"[profile] exclusions: {len(exclude)} episode(s), "
                   f"{tot/60:.1f} min of song/non-spoken audio will be silenced "
                   f"before diarization")

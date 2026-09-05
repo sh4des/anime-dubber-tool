@@ -39,6 +39,14 @@ param(
     [ValidateSet("auto", "ecapa", "pyannote", "resemblyzer")]
     [string]$Diarizer = "ecapa",
 
+    # Which ORIGINAL audio stream to clone from, audio-relative (0 = first). The
+    # default is right for anime, where the Japanese track is first. It is WRONG
+    # for a foreign film carrying a dub as track 0 - e.g. Solaris (1972) ships
+    # Italian AC3 5.1 as a:0 and the original Russian mono as a:1, so cloning
+    # from 0 would clone the Italian dub actors. Feeds Phase A's profile, Phase
+    # B's per-cue emotion reference AND the -MusicBed source.
+    [int]$RefAudioIndex = 0,
+
     # Skip Phase A and reuse the existing <Folder>\anime-dub-profile.json.
     [switch]$SkipProfile,
     # Force fresh Demucs separation in Phase A (else cached stems are reused).
@@ -104,10 +112,11 @@ if ($SkipProfile) {
 else {
     Write-Host "`n=== PHASE A: profiling the whole show ===" -ForegroundColor Cyan
     $pa = @{
-        Folder   = $Folder
-        Scratch  = $Scratch
-        Python   = $Python
-        Diarizer = $Diarizer
+        Folder        = $Folder
+        Scratch       = $Scratch
+        Python        = $Python
+        Diarizer      = $Diarizer
+        RefAudioIndex = $RefAudioIndex
     }
     if ($ProfileEpisodes -gt 0) { $pa.MaxEpisodes = $ProfileEpisodes }
     if ($FreshStems)            { $pa.FreshStems  = $true } else { $pa.ReuseStems = $true }
@@ -121,15 +130,16 @@ else {
 # --- PHASE B: dub every episode with cloned voices ---------------------------
 Write-Host "`n=== PHASE B: dubbing every episode (cloned voices) ===" -ForegroundColor Cyan
 $pb = @{
-    Folder       = $Folder
-    Clone        = $true
-    Engine       = $Engine
-    CloneProfile = $profileJson
-    Redub        = $true       # rebuild existing AI tracks; resume-safe per engine
-    All          = $true       # whole folder, no per-episode prompt
-    Scratch      = $Scratch
-    Python       = $Python
-    Mkvmerge     = $Mkvmerge
+    Folder        = $Folder
+    Clone         = $true
+    Engine        = $Engine
+    CloneProfile  = $profileJson
+    Redub         = $true       # rebuild existing AI tracks; resume-safe per engine
+    All           = $true       # whole folder, no per-episode prompt
+    Scratch       = $Scratch
+    Python        = $Python
+    Mkvmerge      = $Mkvmerge
+    RefAudioIndex = $RefAudioIndex
 }
 if ($Engine -eq "indextts") {
     $pb.IndexTtsPython = $IndexTtsPython

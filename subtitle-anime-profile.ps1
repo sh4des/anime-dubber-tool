@@ -211,7 +211,12 @@ try {
                 if ($NonSpokenStyles) { $sArgs += @("--non-spoken-styles", $NonSpokenStyles) }
                 & $Python @sArgs 2>&1 | ForEach-Object { Write-Verbose "  $_" }
                 if (Test-Path -LiteralPath $epSpans) {
-                    $spanMap[$base] = (Get-Content -LiteralPath $epSpans -Raw | ConvertFrom-Json)
+                    # Only record episodes that actually HAVE spans. An empty
+                    # "[]" comes back from ConvertFrom-Json as $null, which
+                    # ConvertTo-Json then writes as a literal null - and a null
+                    # value in exclude-spans.json crashed profile_show.py.
+                    $parsed = @(Get-Content -LiteralPath $epSpans -Raw | ConvertFrom-Json)
+                    if ($parsed.Count -gt 0) { $spanMap[$base] = $parsed }
                 }
             }
             Remove-Item -LiteralPath $epAss -ErrorAction SilentlyContinue

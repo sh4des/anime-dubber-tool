@@ -232,6 +232,17 @@ $ErrorActionPreference = "Stop"
 # -Verbose is on by default so you can see every step; run with -Verbose:$false to quiet it.
 if (-not $PSBoundParameters.ContainsKey('Verbose')) { $VerbosePreference = 'Continue' }
 
+# Python's stdout falls back to the locale encoding (cp1252 here) when it is
+# redirected to a file, so ANY cue whose text is outside cp1252 kills the engine's
+# own logging with 'charmap' codec can't encode... - and because the per-cue call
+# is wrapped in try/except, that cue is silently DROPPED from the dub. Solaris
+# (1972) lost 2 of 1098 lines this way: its English sub is an OCR job with
+# Cyrillic homoglyphs ("I соuIdn't see the sun" has a Cyrillic s and o, and
+# "FOR К. KELVIN" a Cyrillic Ka). Force UTF-8 so text is never the reason a line
+# goes missing.
+$env:PYTHONIOENCODING = "utf-8"
+$env:PYTHONUNBUFFERED = "1"
+
 # --- tool locations ----------------------------------------------------------
 $FFMPEG  = "ffmpeg"
 $FFPROBE = "ffprobe"
@@ -718,13 +729,20 @@ function Get-MusicBed {
         Write-Warning "  music bed: could not extract source audio; using ducked original instead"
         return $null
     }
-    $demucsOut = Join-Path $WorkDir "demucs"
-    Write-Verbose "  music bed: Demucs isolating music+SFX (htdemucs 2-stem, GPU) ..."
+    $demucsOut = Join-Path $WorkDir "demucs\htdemucs\bed_source"
+    New-Item -ItemType Directory -Force $demucsOut | Out-Null
+    $noVocals = Join-Path $demucsOut "no_vocals.wav"
+    $vocals   = Join-Path $demucsOut "vocals.wav"
+    Write-Verbose "  music bed: Demucs isolating music+SFX (htdemucs 2-stem, GPU, chunked) ..."
     $sw = [Diagnostics.Stopwatch]::StartNew()
-    & $PYTHON -m demucs -n htdemucs --two-stems=vocals -d cuda -o $demucsOut $origWav 2>&1 |
+    # Chunked, not `python -m demucs`: the CLI separates the WHOLE file in one
+    # call, which allocates every stem at full length in host RAM (14.1 GB for a
+    # 2h47m film) and dies. Then this function returns $null and the "music bed"
+    # silently becomes a plain duck of the original, JP dialogue and all.
+    & $PYTHON (Join-Path $PSScriptRoot "demucs_chunked.py") --input $origWav `
+        --out-vocals $vocals --out-no-vocals $noVocals --device cuda 2>&1 |
         ForEach-Object { Write-Verbose "    $_" }
     $ok = ($LASTEXITCODE -eq 0)
-    $noVocals = Join-Path $demucsOut "htdemucs\bed_source\no_vocals.wav"
     if (-not $ok -or -not (Test-Path -LiteralPath $noVocals)) {
         Write-Warning "  music bed: Demucs produced no stem (exit $LASTEXITCODE); using ducked original instead"
         return $null
@@ -735,8 +753,7 @@ function Get-MusicBed {
     # vocal stem for the entire runtime, which silently loses laughs, screams,
     # grunts, breath/formant SFX that htdemucs classes as "vocals", and the sung
     # line of an OP/ED. Demucs already wrote vocals.wav next to no_vocals.wav, so
-    # this costs no extra separation.
-    $vocals = Join-Path $demucsOut "htdemucs\bed_source\vocals.wav"
+    # this costs no extra separation ($vocals was set alongside $noVocals above).
     if (-not $Srt -or -not (Test-Path -LiteralPath $Srt)) {
         Write-Warning "  music bed: no subtitle available; using no_vocals only (non-verbal vocal audio will be lost)"
         return $noVocals
@@ -779,13 +796,20 @@ function Merge-DubIntoVideo {
     $newIdx = $origAudioCount   # output audio index of the mixed English track
     # Duck the FIRST kept original under the dub (index 0 on a fresh run).
     $firstOrig = if ($keepAudioRel.Count) { $keepAudioRel[0] } else { 0 }
+    # ...but the BED must come from the same track we cloned and read emotion
+    # from, i.e. -RefAudioIndex. These are the same stream for anime (JP is a:0),
+    # and differ for a foreign film that ships a dub first: taking the bed from
+    # a:0 there would leave the DUB's non-verbal vocals (screams, laughs, sung
+    # lines) in the mix under an English dub cloned from the original track.
+    # Fall back to $firstOrig if -RefAudioIndex isn't one of the kept originals.
+    $bedOrig = if ($keepAudioRel -contains $RefAudioIndex) { $RefAudioIndex } else { $firstOrig }
     $mixedAac = Join-Path $WorkDir "mixed_english.m4a"
 
     # Bed under the dub: a Demucs music+SFX stem (original dialogue removed) when
     # -MusicBed, else the full original ducked. Input order: 0=video, 1=dub,
     # and 2=bed WAV only when a Demucs stem was produced.
     $bedWav = $null
-    if ($MusicBed) { $bedWav = Get-MusicBed -Video $Video -StreamRel $firstOrig -WorkDir $WorkDir -Srt $Srt }
+    if ($MusicBed) { $bedWav = Get-MusicBed -Video $Video -StreamRel $bedOrig -WorkDir $WorkDir -Srt $Srt }
     if ($bedWav) {
         $bedLabel = "[2:a]"; $bedVol = $BedVolume; $extraIn = @("-i", $bedWav)
         $bedDesc = "music+SFX bed@$([int]($BedVolume*100))% (JP dialogue removed)"

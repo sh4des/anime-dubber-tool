@@ -377,6 +377,7 @@ full argument list in its own header comment and `--help`.
 | `-Python` | `python` | venv A interpreter (auto-uses `.\.venv\Scripts\python.exe` if present) |
 | `-Mkvmerge` | `mkvmerge` | mkvmerge binary, passed to Phase B |
 | `-Diarizer` | `ecapa` | `auto` / `ecapa` / `pyannote` / `resemblyzer`. `ecapa` needs no signup |
+| `-RefAudioIndex` | `0` | Which **original** audio stream to clone from, audio-relative. Feeds Phase A's cast, Phase B's emotion reference and the `-MusicBed` source. See below |
 | `-SkipProfile` | off | Reuse the existing `anime-dub-profile.json` (skip Phase A) |
 | `-FreshStems` | off | Force fresh Demucs separation (otherwise cached stems are reused) |
 | `-ProfileEpisodes` | `0` | Cap Phase A to the first N episodes. `0` = all, which gives the best cast *and* lets every episode use the fast time-overlap match |
@@ -393,6 +394,17 @@ full argument list in its own header comment and `--help`.
 
 Phase B is always invoked with `-Clone -Redub -All`. Note this wrapper does **not** pass
 `-VoiceTuning` — for tuned runs call the two phases directly, as in the workflow above.
+
+**Check `-RefAudioIndex` on any non-anime film.** The default of `0` is right for anime,
+where the Japanese track is first, but a foreign film often ships a *dub* as track 0 —
+Solaris (1972) carries Italian AC3 5.1 as `a:0` (flagged default) and the original Russian
+mono as `a:1`. Left at `0` the pipeline clones the Italian dub actors and transfers *their*
+delivery, then builds the music bed from their mix. Check first and pass the original:
+
+```powershell
+ffprobe -v error -select_streams a -show_entries stream=index:stream_tags=language -of csv=p=0 "<file>"
+     -RefAudioIndex 1        # a:1 = the original-language track
+```
 
 ### `subtitle-anime-profile.ps1` (Phase A)
 
