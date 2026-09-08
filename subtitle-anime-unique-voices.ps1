@@ -34,6 +34,9 @@
 #   pwsh ./subtitle-anime-unique-voices.ps1 -Folder "\\10.0.23.105\media\tv\...\MyShow"
 #   pwsh ./subtitle-anime-unique-voices.ps1 -Folder "..." -All
 #   pwsh ./subtitle-anime-unique-voices.ps1 -Folder "..." -Scratch "D:\dub-scratch"
+#   # a 5.1/7.1 source gets a 5.1/7.1 dub (speech in the centre channel) by
+#   # default; force the old 2.0 fold-down with:
+#   pwsh ./subtitle-anime-unique-voices.ps1 -Folder "..." -DubChannels stereo
 #   # tune matching / thresholds for a show:
 #   pwsh ./subtitle-anime-unique-voices.ps1 -Folder "..." `
 #        -MatchThreshold 0.78 -ChildSplit 310 -ChildPitchShift 3
@@ -92,6 +95,21 @@ param(
     # and out of each muted region, both in seconds.
     [double]$BedDialoguePad = 0.12,
     [double]$BedFade = 0.03,
+
+    # Channel layout of the NEW English dub track.
+    #   'source' (default) - render the dub at the SAME layout as the original
+    #     track it sits over: 5.1 stays 5.1, 7.1 stays 7.1, stereo stays stereo.
+    #     Where the layout has a CENTRE channel the spoken dub is panned into it,
+    #     which is where a real surround mix puts dialogue, and the fronts /
+    #     surrounds / LFE carry the music+SFX bed as they always did.
+    #   'stereo' - the old behaviour: fold everything down to 2.0 AAC.
+    # The ORIGINAL audio tracks are copy-muxed untouched either way (DTS-HD MA,
+    # TrueHD/Atmos, the lot), so this only decides the DUB track's own layout.
+    # Object metadata (Atmos / DTS:X) cannot survive re-encoding a NEW mix, so a
+    # dub built over an Atmos source is channel-based 5.1/7.1, not Atmos - the
+    # untouched Atmos original is still in the file right next to it.
+    [ValidateSet('source', 'stereo')]
+    [string]$DubChannels = 'source',
     # ASS style names whose cues must NOT be spoken, comma-separated (e.g.
     # "OP,OP2,title1,title2"). Some releases mark song lyrics only by STYLE, with
     # no music note in the text - ffmpeg's srt conversion drops the style, so the
@@ -345,6 +363,61 @@ function Invoke-FFProbeJson {
 function Get-VideoDuration {
     param($Probe)
     [double]$Probe.format.duration
+}
+
+# Decide the DUB track's channel layout + encoder from the ORIGINAL audio stream
+# it will be mixed over, honouring -DubChannels. Returns:
+#   Layout   ffmpeg channel-layout name to render the dub track at
+#   Centre   $true when that layout has an FC channel to pan the spoken dub into
+#   Codec    encoder for the dub track. ffmpeg's AC-3 family tops out at 5.1
+#            (see `ffmpeg -h encoder=eac3`), so 7.1 goes to AAC; stereo keeps the
+#            AAC it always used, and 5.1 gets E-AC-3 because that direct-plays on
+#            practically every Plex client instead of being transcoded.
+# Only layouts we can both pan into and encode cleanly are honoured; a 3/4/5/7-
+# channel oddity falls back to stereo and says so rather than guessing at a pan.
+function Get-DubTrackFormat {
+    param($Stream)
+    $stereoFmt = @{ Layout = 'stereo'; Centre = $false; Codec = 'aac'; Bitrate = '256k' }
+    if ($DubChannels -eq 'stereo') { return $stereoFmt }
+    $ch = [int]$Stream.channels
+    # 1ch maps to stereo, not mono: this only ever WIDENS the dub track, so a mono
+    # source keeps producing the stereo dub it always did (same content in L/R)
+    # instead of quietly narrowing to a mono track no earlier run would have made.
+    $fmt = switch ($ch) {
+        1 { $stereoFmt }
+        2 { $stereoFmt }
+        6 { @{ Layout = '5.1';    Centre = $true;  Codec = 'eac3'; Bitrate = '640k' } }
+        8 { @{ Layout = '7.1';    Centre = $true;  Codec = 'aac';  Bitrate = '512k' } }
+        default { $null }
+    }
+    if (-not $fmt) {
+        $srcLayout = if ($Stream.channel_layout) { $Stream.channel_layout } else { 'unknown layout' }
+        Write-Warning ("  dub track: source is {0}ch ({1}), which has no clean pan/encode path; rendering the dub in stereo" -f $ch, $srcLayout)
+        return $stereoFmt
+    }
+    return $fmt
+}
+
+# pan expression that passes a surround layout through but SILENCES the centre
+# channel - the bed's FC is where the original dialogue lives, and it is replaced
+# by (Demucs'd centre + dub) further down the graph. Named channels, so it does
+# not matter whether ffmpeg calls the rears BL/BR or SL/SR internally; the
+# preceding aformat has already normalised the layout to $Layout.
+# Resample + pin an input to one layout before it is mixed. amix requires every
+# input to agree on layout, and this is also what converts a 5.1(side) source to
+# canonical 5.1 so the named-channel pans below are deterministic.
+function Get-LayoutChain {
+    param([string]$Layout)
+    "aresample=48000,aformat=sample_fmts=fltp:channel_layouts=$Layout"
+}
+
+function Get-BedDropCentrePan {
+    param([string]$Layout)
+    switch ($Layout) {
+        '5.1' { 'pan=5.1|FL=FL|FR=FR|LFE=LFE|BL=BL|BR=BR' }
+        '7.1' { 'pan=7.1|FL=FL|FR=FR|LFE=LFE|BL=BL|BR=BR|SL=SL|SR=SR' }
+        default { throw "Get-BedDropCentrePan: no centre channel in layout '$Layout'" }
+    }
 }
 
 # True when the file already has an AI dub track from a previous successful run.
@@ -720,10 +793,18 @@ function New-DubTrack {
 # bleed. Returns the no_vocals WAV path, or $null on failure (caller falls back to
 # ducking the full original). Uses $PYTHON (the venv with demucs installed).
 function Get-MusicBed {
-    param([string]$Video, [int]$StreamRel, [string]$WorkDir, [string]$Srt)
+    param([string]$Video, [int]$StreamRel, [string]$WorkDir, [string]$Srt,
+          [switch]$CentreOnly)
     $origWav = Join-Path $WorkDir "bed_source.wav"
-    $ex = @("-y", "-nostdin", "-v", "error", "-i", $Video, "-map", "0:a:$StreamRel",
-            "-ac", "2", "-ar", "44100", "-c:a", "pcm_s16le", $origWav)
+    # htdemucs is a 2-channel model, so a 5.1/7.1 source cannot be separated
+    # whole - and it does not need to be. In a surround mix the dialogue is in
+    # the CENTRE channel, so with -CentreOnly we pull FC out on its own (mono)
+    # and separate just that. The fronts, surrounds and LFE then stay untouched
+    # in the mix instead of being folded down to 2.0, and the Demucs pass is
+    # cheaper than the stereo one it replaces.
+    $chArgs = if ($CentreOnly) { @("-af", "pan=mono|c0=FC") } else { @("-ac", "2") }
+    $ex = @("-y", "-nostdin", "-v", "error", "-i", $Video, "-map", "0:a:$StreamRel") +
+           $chArgs + @("-ar", "44100", "-c:a", "pcm_s16le", $origWav)
     & $FFMPEG @ex
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $origWav)) {
         Write-Warning "  music bed: could not extract source audio; using ducked original instead"
@@ -733,14 +814,17 @@ function Get-MusicBed {
     New-Item -ItemType Directory -Force $demucsOut | Out-Null
     $noVocals = Join-Path $demucsOut "no_vocals.wav"
     $vocals   = Join-Path $demucsOut "vocals.wav"
-    Write-Verbose "  music bed: Demucs isolating music+SFX (htdemucs 2-stem, GPU, chunked) ..."
+    $bedWidth = if ($CentreOnly) { "centre channel only, mono" } else { "stereo" }
+    Write-Verbose "  music bed: Demucs isolating music+SFX ($bedWidth, htdemucs 2-stem, GPU, chunked) ..."
     $sw = [Diagnostics.Stopwatch]::StartNew()
     # Chunked, not `python -m demucs`: the CLI separates the WHOLE file in one
     # call, which allocates every stem at full length in host RAM (14.1 GB for a
     # 2h47m film) and dies. Then this function returns $null and the "music bed"
     # silently becomes a plain duck of the original, JP dialogue and all.
-    & $PYTHON (Join-Path $PSScriptRoot "demucs_chunked.py") --input $origWav `
-        --out-vocals $vocals --out-no-vocals $noVocals --device cuda 2>&1 |
+    $demucsArgs = @("--input", $origWav, "--out-vocals", $vocals,
+                    "--out-no-vocals", $noVocals, "--device", "cuda")
+    if ($CentreOnly) { $demucsArgs += "--mono" }
+    & $PYTHON (Join-Path $PSScriptRoot "demucs_chunked.py") @demucsArgs 2>&1 |
         ForEach-Object { Write-Verbose "    $_" }
     $ok = ($LASTEXITCODE -eq 0)
     if (-not $ok -or -not (Test-Path -LiteralPath $noVocals)) {
@@ -803,21 +887,35 @@ function Merge-DubIntoVideo {
     # lines) in the mix under an English dub cloned from the original track.
     # Fall back to $firstOrig if -RefAudioIndex isn't one of the kept originals.
     $bedOrig = if ($keepAudioRel -contains $RefAudioIndex) { $RefAudioIndex } else { $firstOrig }
-    $mixedAac = Join-Path $WorkDir "mixed_english.m4a"
+
+    # Layout of the DUB track, so a 5.1 DTS / 7.1 TrueHD source no longer gets a
+    # stereo-only dub bolted on. It has to match the stream the bed is READ FROM,
+    # and which stream that is depends on whether Demucs gave us a stem: the bed
+    # comes from $bedOrig with -MusicBed, and from the ducked $firstOrig without.
+    # $bedFmt therefore only decides how to SEPARATE (centre channel alone, or the
+    # whole thing in stereo); the final $fmt is settled once the stem is in hand.
+    $fmtFor = {
+        param([int]$Rel)
+        if ($audioStreams.Count) { Get-DubTrackFormat -Stream $audioStreams[$Rel] }
+        else { @{ Layout = 'stereo'; Centre = $false; Codec = 'aac'; Bitrate = '256k' } }
+    }
+    $bedFmt = & $fmtFor $bedOrig
 
     # Bed under the dub: a Demucs music+SFX stem (original dialogue removed) when
     # -MusicBed, else the full original ducked. Input order: 0=video, 1=dub,
-    # and 2=bed WAV only when a Demucs stem was produced.
+    # and 2=bed WAV only when a Demucs stem was produced. For a surround layout
+    # that stem is the CENTRE channel alone (see Get-MusicBed) - the rest of the
+    # bed is read straight off the source stream, untouched.
     $bedWav = $null
-    if ($MusicBed) { $bedWav = Get-MusicBed -Video $Video -StreamRel $bedOrig -WorkDir $WorkDir -Srt $Srt }
-    if ($bedWav) {
-        $bedLabel = "[2:a]"; $bedVol = $BedVolume; $extraIn = @("-i", $bedWav)
-        $bedDesc = "music+SFX bed@$([int]($BedVolume*100))% (JP dialogue removed)"
+    if ($MusicBed) {
+        $bedWav = Get-MusicBed -Video $Video -StreamRel $bedOrig -WorkDir $WorkDir `
+                               -Srt $Srt -CentreOnly:$bedFmt.Centre
     }
-    else {
-        $bedLabel = "[0:a:$firstOrig]"; $bedVol = $OriginalVolume; $extraIn = @()
-        $bedDesc = "original@$([int]($OriginalVolume*100))%"
-    }
+    $fmt = if ($bedWav) { $bedFmt } else { & $fmtFor $firstOrig }
+    # E-AC-3 is not a legal MP4 payload, so the intermediate rides in Matroska
+    # for anything but AAC. Either way pass 2 only stream-copies out of it.
+    $mixedExt = if ($fmt.Codec -eq 'aac') { "m4a" } else { "mka" }
+    $mixedAudio = Join-Path $WorkDir "mixed_english.$mixedExt"
     # Optional EBU R128 loudness pass on the dub for episode-to-episode balance
     # (gated by "loudnorm": true in the voice-tuning JSON).
     $dubLoud = ""
@@ -827,11 +925,56 @@ function Merge-DubIntoVideo {
             if ($vt.global.loudnorm) { $dubLoud = ",loudnorm=I=-16:TP=-1.5:LRA=11" }
         } catch { Write-Warning "  could not parse VoiceTuning for loudnorm flag: $_" }
     }
-    $filter = "${bedLabel}aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,volume=${bedVol}[orig];" +
-              "[1:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,volume=1.0${dubLoud}[dub];" +
-              "[orig][dub]amix=inputs=2:duration=first:dropout_transition=0:normalize=0,alimiter=limit=0.95[mix]"
+    $L = $fmt.Layout
+    $mixTail = "amix=inputs=2:duration=first:dropout_transition=0:normalize=0,alimiter=limit=0.95[mix]"
+    $chainL = Get-LayoutChain -Layout $L
+    $chainMono = Get-LayoutChain -Layout 'mono'
+    $extraIn = if ($bedWav) { @("-i", $bedWav) } else { @() }
 
-    Write-Verbose "  [pass 1] rendering mixed English track: dub@100% + $bedDesc (stereo, 48kHz AAC)"
+    if ($fmt.Centre) {
+        # Surround: the spoken dub is panned into FC, where dialogue belongs. The
+        # TTS track is mono, so it is normalised to mono before the pan rather
+        # than trusting whatever the engine wrote.
+        $dubChain = "[1:a]$chainMono,volume=1.0${dubLoud}"
+        if ($bedWav) {
+            # Bed = source stream with FC silenced (its dialogue is what we are
+            # replacing) + the Demucs'd centre, and the dub joins it in FC. Every
+            # other channel passes through, so the surround field survives intact.
+            $bedDesc = "music+SFX bed@$([int]($BedVolume*100))% (centre de-dialogued, surrounds intact)"
+            $filter = "[0:a:$bedOrig]$chainL,$(Get-BedDropCentrePan -Layout $L),volume=$BedVolume[bedrest];" +
+                      "[2:a]$chainMono,volume=$BedVolume[bedfc];" +
+                      "$dubChain[dubm];" +
+                      "[bedfc][dubm]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[fc];" +
+                      "[fc]pan=$L|FC=c0[fcp];" +
+                      "[bedrest][fcp]$mixTail"
+        }
+        else {
+            # No Demucs stem: duck the whole original at its native layout and lay
+            # the dub over the centre, same trade as the stereo path always made.
+            $bedDesc = "original@$([int]($OriginalVolume*100))%"
+            $filter = "[0:a:$firstOrig]$chainL,volume=$OriginalVolume[orig];" +
+                      "$dubChain,pan=$L|FC=c0[dub];" +
+                      "[orig][dub]$mixTail"
+        }
+    }
+    else {
+        # Mono/stereo: no centre channel to aim at, so dub and bed are simply
+        # mixed across the full width (the original behaviour).
+        if ($bedWav) {
+            $bedLabel = "[2:a]"; $bedVol = $BedVolume
+            $bedDesc = "music+SFX bed@$([int]($BedVolume*100))% (JP dialogue removed)"
+        }
+        else {
+            $bedLabel = "[0:a:$firstOrig]"; $bedVol = $OriginalVolume
+            $bedDesc = "original@$([int]($OriginalVolume*100))%"
+        }
+        $filter = "${bedLabel}$chainL,volume=${bedVol}[orig];" +
+                  "[1:a]$chainL,volume=1.0${dubLoud}[dub];" +
+                  "[orig][dub]$mixTail"
+    }
+
+    Write-Verbose ("  [pass 1] rendering mixed English track: dub@100% + {0} ({1}, 48kHz {2}@{3})" -f `
+        $bedDesc, $L, $fmt.Codec.ToUpper(), $fmt.Bitrate)
     Write-Verbose "  filter: $filter"
     $p1 = @(
         "-y", "-nostdin", "-v", $FF_LOGLEVEL, "-stats",
@@ -840,23 +983,24 @@ function Merge-DubIntoVideo {
     ) + $extraIn + @(
         "-filter_complex", $filter,
         "-map", "[mix]",
-        "-c:a", "aac", "-b:a", "256k", "-ar", "48000",
-        $mixedAac
+        "-c:a", $fmt.Codec, "-b:a", $fmt.Bitrate, "-ar", "48000",
+        $mixedAudio
     )
     Write-Cmd $FFMPEG $p1
     $sw = [Diagnostics.Stopwatch]::StartNew()
     & $FFMPEG @p1
-    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $mixedAac)) {
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $mixedAudio)) {
         throw "ffmpeg mix (pass 1) failed for $Video"
     }
 
-    # Pass 2: pure copy-mux. Video + all original audio + new English track
-    # (copied from the clean AAC) + subs + attachments. No re-encode.
+    # Pass 2: pure copy-mux. Video + all original audio (DTS-HD MA, TrueHD/Atmos
+    # and all, bit-for-bit) + new English track copied from the clean intermediate
+    # + subs + attachments. No re-encode.
     Write-Verbose "  [pass 2] copy-muxing: video + $origAudioCount original audio + English track a:$newIdx (default)"
     $p2 = @(
         "-y", "-nostdin", "-v", $FF_LOGLEVEL, "-stats",
         "-i", $Video,
-        "-i", $mixedAac,
+        "-i", $mixedAudio,
         "-map", "0:v"
     )
     # Keep only the original (non-AI-dub) audio tracks, in order, then the new one.
@@ -885,7 +1029,7 @@ function Merge-DubIntoVideo {
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $OutVideo)) {
         throw "ffmpeg mux (pass 2) failed for $Video"
     }
-    Remove-Item -LiteralPath $mixedAac -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $mixedAudio -Force -ErrorAction SilentlyContinue
     $sizeMB = [math]::Round((Get-Item -LiteralPath $OutVideo).Length / 1MB, 1)
     Write-Verbose ("  mux finished in {0:n1}s -> {1} ({2} MB)" -f $sw.Elapsed.TotalSeconds, $OutVideo, $sizeMB)
 }

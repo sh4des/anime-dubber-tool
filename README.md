@@ -54,6 +54,41 @@ One command, two phases:
 just ducking the original — no Japanese-voice bleed, and laughs / screams / OP-ED singing
 are kept. `-BackupOriginal` leaves a `<name>.pre-dub.mkv` rollback copy.
 
+### Surround sources (5.1 / 7.1 / DTS-HD / TrueHD-Atmos)
+
+The **original** audio tracks are always copy-muxed bit-for-bit — DTS-HD MA, TrueHD/Atmos
+and all — so nothing about the source is ever lost. What used to be stereo-only was the
+**new dub track**, and `-DubChannels source` (the default) now renders it at the source's
+own layout instead:
+
+| Source | Dub track | Where the dub sits |
+|---|---|---|
+| mono / stereo | AAC, same layout | mixed across the full width |
+| 6ch (5.1, DTS, DTS-HD MA, TrueHD 5.1) | **E-AC-3 5.1** @640k | **centre channel** |
+| 8ch (7.1) | **AAC 7.1** @512k | **centre channel** |
+| 3 / 4 / 5 / 7ch oddities | AAC stereo (warns) | full width |
+
+For a surround layout the dub is panned into **FC**, which is where a real surround mix puts
+dialogue, and the bed is built the same way: htdemucs is a 2-channel model, so instead of
+folding 5.1 down to stereo the script pulls **FC alone** out of the source, separates that,
+and leaves the fronts, surrounds and LFE untouched. The score and effects keep their full
+surround field, only the centre is de-dialogued. It is also a *cheaper* Demucs pass than the
+stereo one it replaces.
+
+Two honest caveats:
+
+* **Atmos / DTS:X object metadata cannot survive** — the dub track is a *new* mix, and
+  re-encoding one collapses objects to channels. The dub is channel-based 5.1/7.1; the
+  untouched Atmos original is still in the file right next to it, so players that want it
+  can still pick it.
+* The centre-channel trick assumes **dialogue is in FC**, which is true of real surround
+  film mixes (the case this matters for). A 5.1 *upmix* of a stereo anime track can smear
+  some dialogue into FL/FR; pass `-DubChannels stereo` there to get the old full-width
+  Demucs bed back.
+
+E-AC-3 is chosen for 5.1 because it direct-plays on practically every Plex client rather
+than being transcoded; ffmpeg's AC-3 family tops out at 5.1, so 7.1 goes to AAC.
+
 Budget hours per show. Ctrl-C is safe: Phase B is resume-safe, so re-running the same
 command picks up where it stopped. For a noticeably cleaner clone, also pass the Phase A
 stem cache as the emotion reference:
@@ -387,6 +422,7 @@ full argument list in its own header comment and `--help`.
 | `-EmoAlpha` | `0.45` | Emotion strength 0..1 |
 | `-EmotionStemsDir` | `""` | Phase A stem cache; makes the emotion reference the clean vocal stem |
 | `-MusicBed` / `-BedVolume` | off / `0.9` | Dub over a Demucs music+SFX bed instead of ducking the original |
+| `-DubChannels` | `source` | Dub-track layout: `source` keeps the original's (5.1 dub for a 5.1 film, speech in the centre), `stereo` folds to 2.0 |
 | `-BackupOriginal` | off | Keep `<name>.pre-dub.<ext>` |
 | `-UseDubbedFolder` | off | Write to `<Folder>\dubbed\` |
 | `-NoFit` | off | Disable cue duration-fit, which is **on** by default in this wrapper |
@@ -452,6 +488,7 @@ Stems cache at `<Scratch>\dubprofile-stems_<folder name>` — that's the path to
 | `-BedDialoguePad` | `0.12` | Extra seconds muted each side of a cue, for loose subtitle timing |
 | `-BedFade` | `0.03` | Ramp in/out of each muted region, seconds |
 | `-OriginalVolume` | `0.6` | Original-audio level under the dub when *not* using `-MusicBed` |
+| `-DubChannels` | `source` | Channel layout of the dub track: `source` matches the original (5.1 stays 5.1, 7.1 stays 7.1), `stereo` folds it to 2.0 |
 | `-Redub` | off | Strip the existing AI dub track and rebuild it (lossless) |
 | `-Force` | off | Bypass the resume-skip for episodes already dubbed by this engine |
 | `-ReuseDub` | off | Reuse a cached dub WAV from `<Scratch>\dubwav-cache` and skip the TTS render — lets you re-run just the mux/install step |

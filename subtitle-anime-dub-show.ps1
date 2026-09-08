@@ -70,6 +70,13 @@ param(
     [switch]$MusicBed,
     [double]$BedVolume = 0.9,
 
+    # Channel layout of the new dub track, passed through to Phase B. 'source'
+    # (default) keeps the original's layout - a 5.1/7.1 film gets a 5.1/7.1 dub
+    # with the speech in the centre channel; 'stereo' folds it to 2.0 as the
+    # pipeline used to. The original tracks are copy-muxed untouched either way.
+    [ValidateSet("source", "stereo")]
+    [string]$DubChannels = "source",
+
     # Passed through to Phase B.
     [switch]$BackupOriginal,     # keep <name>.pre-dub.<ext> before replacing
     [switch]$UseDubbedFolder,    # write to <Folder>\dubbed\ instead of in place
@@ -152,6 +159,7 @@ if ($BackupOriginal)    { $pb.BackupOriginal = $true }
 if ($UseDubbedFolder)   { $pb.UseDubbedFolder = $true }
 if ($StartFrom)         { $pb.StartFrom      = $StartFrom }
 if ($MusicBed)          { $pb.MusicBed = $true; $pb.BedVolume = $BedVolume }
+if ($DubChannels)       { $pb.DubChannels = $DubChannels }
 & $dubScript @pb
 
 $overall.Stop()
