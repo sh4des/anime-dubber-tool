@@ -277,6 +277,11 @@ def main():
     ap.add_argument("--max-speed", type=float, default=1.6)
     ap.add_argument("--fp16", action="store_true")
     ap.add_argument("--verbose", action="store_true")
+    ap.add_argument("--cue-cache", default=None,
+                    help="keep each cue's raw TTS output here, keyed by everything that "
+                         "shapes it, so a killed render (game-gate releasing the GPU) "
+                         "resumes from the last finished cue instead of from cue 0. "
+                         "Emptied after the dub WAV is written.")
     args = ap.parse_args()
 
     try:
@@ -385,11 +390,47 @@ def main():
         eprint(f"[indextts] FATAL: cannot import IndexTTS2 ({e}). "
                f"Run this under the IndexTTS2 venv.")
         return 3
-    eprint(f"[indextts] loading IndexTTS2 from {args.checkpoints_dir} "
-           f"(fp16={args.fp16}) ...")
-    tts = IndexTTS2(cfg_path=cfg, model_dir=args.checkpoints_dir,
-                    use_fp16=args.fp16, use_deepspeed=False,
-                    use_cuda_kernel=False)
+    # The model is loaded on the first cue the cache cannot supply, so a resumed
+    # render whose cues are all cached never touches the GPU.
+    tts = None
+
+    def get_tts():
+        nonlocal tts
+        if tts is None:
+            eprint(f"[indextts] loading IndexTTS2 from {args.checkpoints_dir} "
+                   f"(fp16={args.fp16}) ...")
+            tts = IndexTTS2(cfg_path=cfg, model_dir=args.checkpoints_dir,
+                            use_fp16=args.fp16, use_deepspeed=False,
+                            use_cuda_kernel=False)
+        return tts
+
+    # --- per-cue resume cache ---------------------------------------------------
+    # Key = every input that shapes a cue's RAW TTS output. Gain / fit / placement
+    # are applied after the cache, so tuning those never invalidates it.
+    cache = args.cue_cache
+    if cache:
+        import hashlib
+        os.makedirs(cache, exist_ok=True)
+        try:
+            ck_sig = sorted((f, os.path.getsize(os.path.join(args.checkpoints_dir, f)))
+                            for f in os.listdir(args.checkpoints_dir))
+        except OSError:
+            ck_sig = []
+        reused = 0
+
+    def cue_key(i, c, timbre, ce, parts):
+        try:
+            ts = (os.path.getsize(timbre), int(os.path.getmtime(timbre)))
+        except OSError:
+            ts = None
+        blob = json.dumps({
+            "i": i, "parts": parts, "timbre": os.path.abspath(timbre), "ts": ts,
+            "emo": None if (args.no_emotion or ce <= 0) else
+                   [os.path.basename(args.ref_audio), round(c["start"], 3), round(c["end"], 3), ce],
+            "seed": (G_SEED + i) if _torch is not None else None, "temp": G_TEMP,
+            "maxseg": G_MAXSEG, "fp16": bool(args.fp16), "ck": ck_sig,
+        }, sort_keys=True)
+        return hashlib.sha1(blob.encode("utf-8")).hexdigest()[:16]
 
     # --- render ---------------------------------------------------------------
     total_sec = max(args.duration, max(c["end"] for c in cues)) + 2.0
@@ -405,8 +446,20 @@ def main():
                    f"skipping")
             continue
         ce = emo_for(c["speaker"])
+        parts = split_long(c["text"], limit=G_NOSPLIT)
+        cpath = None
+        if cache:
+            cpath = os.path.join(cache, f"cue_{i:04d}_{cue_key(i, c, timbre, ce, parts)}.npy")
+        if cpath and os.path.isfile(cpath):
+            try:
+                clip = np.load(cpath)
+                reused += 1
+            except (OSError, ValueError):
+                clip = None
+        else:
+            clip = None
         emo = None
-        if not args.no_emotion and ce > 0:
+        if clip is None and not args.no_emotion and ce > 0:
             emo = emotion_clip(ref, ref_sr, c["start"], c["end"], work, i)
 
         # loudness of the ORIGINAL line under this cue (from the isolated vocal
@@ -418,37 +471,46 @@ def main():
                 seg = ref[oa:ob]
                 orig_rms = float(np.sqrt(np.mean(seg ** 2)))
 
-        # fixed seed per cue: reproducible, and keeps any split pieces consistent
-        # (prevents the voice drifting mid-line)
-        if _torch is not None:
-            _torch.manual_seed(G_SEED + i)
+        if clip is None:
+            # fixed seed per cue: reproducible, and keeps any split pieces consistent
+            # (prevents the voice drifting mid-line)
+            if _torch is not None:
+                _torch.manual_seed(G_SEED + i)
 
-        pieces = []
-        for j, part in enumerate(split_long(c["text"], limit=G_NOSPLIT)):
-            tmp = os.path.join(work, f"cue_{i:04d}_{j}.wav")
-            try:
-                tts.infer(spk_audio_prompt=timbre, text=part, output_path=tmp,
-                          emo_audio_prompt=emo, emo_alpha=ce,
-                          verbose=False,
-                          max_text_tokens_per_segment=G_MAXSEG,
-                          temperature=G_TEMP)
-            except Exception as e:
-                eprint(f"[indextts]   cue {i} piece {j} failed: {e}")
+            pieces = []
+            failed = False
+            for j, part in enumerate(parts):
+                tmp = os.path.join(work, f"cue_{i:04d}_{j}.wav")
+                try:
+                    get_tts().infer(spk_audio_prompt=timbre, text=part, output_path=tmp,
+                                    emo_audio_prompt=emo, emo_alpha=ce,
+                                    verbose=False,
+                                    max_text_tokens_per_segment=G_MAXSEG,
+                                    temperature=G_TEMP)
+                except Exception as e:
+                    eprint(f"[indextts]   cue {i} piece {j} failed: {e}")
+                    failed = True
+                    continue
+                y, _ = librosa.load(tmp, sr=OUT_SR, mono=True)
+                pieces.append(y)
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+            if emo:
+                try:
+                    os.remove(emo)
+                except OSError:
+                    pass
+            if not pieces:
                 continue
-            y, _ = librosa.load(tmp, sr=OUT_SR, mono=True)
-            pieces.append(y)
-            try:
-                os.remove(tmp)
-            except OSError:
-                pass
-        if emo:
-            try:
-                os.remove(emo)
-            except OSError:
-                pass
-        if not pieces:
-            continue
-        clip = np.concatenate(pieces) if len(pieces) > 1 else pieces[0]
+            clip = np.concatenate(pieces) if len(pieces) > 1 else pieces[0]
+            # only a cue whose every piece rendered is cached; written to a temp
+            # name and renamed, so a kill mid-write never leaves a torn cue behind
+            if cpath and not failed:
+                tmpc = cpath + ".part.npy"
+                np.save(tmpc, clip.astype(np.float32, copy=False))
+                os.replace(tmpc, cpath)
 
         # match this line's loudness to the ORIGINAL line it replaces (retains the
         # source mix's dynamics/intent), rather than leveling characters equally.
@@ -495,12 +557,27 @@ def main():
     sf.write(args.out, canvas, OUT_SR)
     eprint(f"[indextts] wrote {args.out}  ({rendered}/{n} lines, "
            f"{total_sec:.0f}s @ {OUT_SR}Hz)")
+    if cache:
+        eprint(f"[indextts] cue cache: {reused}/{n} cues resumed from {cache}")
 
     try:
         import shutil
         shutil.rmtree(work, ignore_errors=True)
     except Exception:
         pass
+    # The render is complete and on disk, so the resume cache has done its job:
+    # remove only the cue files this script writes, then the folder if now empty.
+    if cache:
+        import glob
+        for f in glob.glob(os.path.join(cache, "cue_[0-9][0-9][0-9][0-9]_*.npy")):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+        try:
+            os.rmdir(cache)
+        except OSError:
+            pass
     return 0
 
 

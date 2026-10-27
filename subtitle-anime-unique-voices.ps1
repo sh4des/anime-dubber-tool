@@ -702,6 +702,10 @@ function New-DubTrack {
         }
         if ($FitToCues) { $pyArgs += "--fit" }
         $pyArgs += "--verbose"
+        # Per-cue resume cache, stable per episode: game-gate kills a render to free
+        # the GPU for a game, and the redo picks up from the last finished cue.
+        $cueKey = ([IO.Path]::GetFileNameWithoutExtension($OutWav)) -replace '[^\w.-]', '_'
+        $pyArgs += @("--cue-cache", (Join-Path $Scratch "tts-cue-cache\$cueKey"))
 
         Write-Host "  synthesizing IndexTTS2 cloned+emotion dub on GPU..."
         Write-Cmd $IndexTtsPython $pyArgs
